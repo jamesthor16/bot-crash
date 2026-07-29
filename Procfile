@@ -1,0 +1,1 @@
+worker: python Crash_bot.py

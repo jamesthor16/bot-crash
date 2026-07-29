@@ -1,0 +1,44 @@
+{
+  "8340327832": {
+    "restants": 0,
+    "vip": false,
+    "code": "BT7YGH",
+    "gratuits_deja_donnes": true,
+    "signaux_gratuits_restants": 0,
+    "vip_signals": 12,
+    "illimite": false,
+    "historique_signaux": [
+      {
+        "timestamp": 1785202611.371786,
+        "signal": "1.65x",
+        "statut": "gratuit"
+      },
+      {
+        "timestamp": 1785203152.864223,
+        "signal": "3.37x",
+        "statut": "gratuit"
+      },
+      {
+        "timestamp": 1785203396.714748,
+        "signal": "3.23x",
+        "statut": "gratuit"
+      },
+      {
+        "timestamp": 1785206277.377398,
+        "signal": "2.4x",
+        "statut": "vip"
+      },
+      {
+        "timestamp": 1785231767.848242,
+        "signal": "3.01x",
+        "statut": "vip"
+      },
+      {
+        "timestamp": 1785231968.081028,
+        "signal": "2.71x",
+        "statut": "vip"
+      }
+    ],
+    "dernier_signal": 1785231968.081002
+  }
+}
