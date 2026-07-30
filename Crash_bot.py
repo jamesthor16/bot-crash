@@ -21,12 +21,15 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 
 TOKEN = os.getenv("TOKEN")
 DATA_FILE = "users.json"
 ADMIN_ID_FILE = "admin_id.json"
+SECURITY_LOG_FILE = "security_log.json"
 SIGNAUX_DEFAUT = 3
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "hacker_ci").lstrip("@")
 COOLDOWN_SECONDS = 30
@@ -103,6 +106,41 @@ def charger_users():
 
 def sauvegarder_users(data):
     ecrire_json(DATA_FILE, data)
+
+
+def charger_journal_securite():
+    journal = lire_json(SECURITY_LOG_FILE, [])
+    return journal if isinstance(journal, list) else []
+
+
+def sauvegarder_journal_securite(journal):
+    ecrire_json(SECURITY_LOG_FILE, journal[-1000:])
+
+
+def date_heure_securite():
+    return datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+
+
+def journaliser_securite(evenement, code, telegram_id, ancien_telegram_id=None):
+    journal = charger_journal_securite()
+    journal.append(
+        {
+            "date": date_heure_securite(),
+            "evenement": evenement,
+            "code": code,
+            "telegram_id": telegram_id,
+            "ancien_telegram_id": ancien_telegram_id,
+        }
+    )
+    sauvegarder_journal_securite(journal)
+
+
+def telegram_id_enregistre(user):
+    valeur = user.get("telegram_id")
+    try:
+        return int(valeur) if valeur is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def entier_positif(valeur, defaut=0, maximum=None):
@@ -212,7 +250,7 @@ def appliquer_expiration_si_necessaire(user, maintenant=None):
 def migrer_si_besoin(data):
     modifie = False
 
-    for user in data.values():
+    for uid, user in data.items():
         if not isinstance(user, dict):
             continue
 
@@ -226,6 +264,12 @@ def migrer_si_besoin(data):
 
         if "code" not in user:
             user["code"] = generer_code_unique(data)
+
+        if "telegram_id" not in user:
+            user["telegram_id"] = int(uid) if str(uid).isdigit() else None
+
+        if "banned" not in user:
+            user["banned"] = False
 
         if "messages" in user and not isinstance(user["messages"], list):
             user["messages"] = []
@@ -272,15 +316,34 @@ def trouver_uid_par_code(data, code_cible):
     )
 
 
-def get_ou_creer_user(user_id):
+def associer_ou_creer_user(user_id, code_cible=None):
     data = migrer_si_besoin(charger_users())
     uid = str(user_id)
+    code_cible = code_cible.upper() if code_cible else None
+
+    if code_cible:
+        uid_code = trouver_uid_par_code(data, code_cible)
+        if uid_code is not None and uid_code != uid:
+            user_code = data[uid_code]
+            ancien_telegram_id = telegram_id_enregistre(user_code)
+            if ancien_telegram_id and ancien_telegram_id != user_id:
+                journaliser_securite("tentative_connexion", code_cible, user_id, ancien_telegram_id)
+                return data, uid_code, "device_locked", ancien_telegram_id
+
+            user_code["telegram_id"] = user_id
+            data[uid] = user_code
+            del data[uid_code]
+            sauvegarder_users(data)
+            journaliser_securite("connexion", user_code.get("code", code_cible), user_id)
+            return data, uid, "ok", None
 
     if uid not in data:
         data[uid] = {
             "restants": SIGNAUX_DEFAUT,
             "vip": False,
             "code": generer_code_unique(data),
+            "telegram_id": user_id,
+            "banned": False,
             "gratuits_deja_donnes": True,
             "signaux_gratuits_restants": SIGNAUX_DEFAUT,
             "vip_signals": 0,
@@ -288,6 +351,27 @@ def get_ou_creer_user(user_id):
             "historique_signaux": [],
         }
         sauvegarder_users(data)
+        journaliser_securite("connexion", data[uid].get("code"), user_id)
+        return data, uid, "ok", None
+
+    user = data[uid]
+    ancien_telegram_id = telegram_id_enregistre(user)
+    if ancien_telegram_id and ancien_telegram_id != user_id:
+        journaliser_securite("tentative_connexion", user.get("code", "?"), user_id, ancien_telegram_id)
+        return data, uid, "device_locked", ancien_telegram_id
+
+    if ancien_telegram_id is None:
+        user["telegram_id"] = user_id
+        sauvegarder_users(data)
+
+    if user.get("banned", False):
+        return data, uid, "banned", None
+
+    return data, uid, "ok", None
+
+
+def get_ou_creer_user(user_id, code_cible=None):
+    data, uid, statut, _ = associer_ou_creer_user(user_id, code_cible=code_cible)
 
     return data, uid
 
@@ -614,6 +698,17 @@ def bouton_vip():
             [InlineKeyboardButton("💎 Acheter un pack", callback_data="vip")],
             [InlineKeyboardButton("📞 Support", callback_data="support")],
             [InlineKeyboardButton("ℹ️ Mon code", callback_data="code")],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="retour")],
+        ]
+    )
+
+
+def bouton_vip_pack():
+    """Menu des packs VIP avec retour vers VIP & Support."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📞 Support", callback_data="support")],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="vip_menu")],
         ]
     )
 
@@ -637,10 +732,29 @@ async def remplacer_message(query, texte, markup=None):
     )
 
 
+async def modifier_message(query, texte, markup=None):
+    """Modifie le message courant et garde une navigation fluide."""
+    try:
+        return await query.message.edit_text(
+            text=texte,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        logger.info("Impossible de modifier le message. Envoi d'un nouveau message.")
+        return await query.message.chat.send_message(
+            text=texte,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+
+
 def handler_securise(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
+            if not await controler_acces_client(update, context):
+                return None
             return await func(update, context)
         except Exception as exc:
             logger.exception("Erreur dans %s", func.__name__, exc_info=exc)
@@ -670,6 +784,72 @@ async def refuser_non_admin(update: Update):
         await update.effective_message.reply_text("❌ Commande réservée à l'administrateur.", parse_mode=ParseMode.HTML)
 
 
+async def envoyer_message_acces(update: Update, texte):
+    if update.callback_query:
+        await update.callback_query.answer()
+        try:
+            await update.callback_query.message.edit_text(texte, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            await update.callback_query.message.reply_text(texte, parse_mode=ParseMode.HTML)
+    elif update.effective_message:
+        await update.effective_message.reply_text(texte, parse_mode=ParseMode.HTML)
+
+
+async def notifier_tentative_connexion(context: ContextTypes.DEFAULT_TYPE, code, ancien_telegram_id, nouveau_telegram_id):
+    admin_id = get_admin_id()
+    if not admin_id:
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=(
+                "🚨 <b>Tentative de connexion détectée</b>\n\n"
+                f"<b>Code :</b>\n<code>{echapper_html_texte(code)}</code>\n\n"
+                f"<b>Ancien Telegram ID :</b>\n<code>{echapper_html_texte(ancien_telegram_id)}</code>\n\n"
+                f"<b>Nouveau Telegram ID :</b>\n<code>{echapper_html_texte(nouveau_telegram_id)}</code>\n\n"
+                f"<b>Date :</b>\n{echapper_html_texte(date_heure_securite())}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        logger.exception("Impossible de notifier l'administrateur de la tentative de connexion.")
+
+
+async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or est_admin(update):
+        return True
+
+    code_start = None
+    if update.effective_message and update.effective_message.text:
+        morceaux = update.effective_message.text.split()
+        if morceaux and morceaux[0].split("@")[0].lower() == "/start" and len(morceaux) > 1:
+            code_start = morceaux[1].upper()
+
+    user_id = update.effective_user.id
+    data, uid, statut, ancien_telegram_id = associer_ou_creer_user(user_id, code_cible=code_start)
+    user = data.get(uid, {}) if uid else {}
+
+    if statut == "device_locked":
+        code = user.get("code", code_start or "?")
+        await envoyer_message_acces(
+            update,
+            "❌ Ce compte est déjà associé à un autre compte Telegram.\n\n"
+            "Si vous avez changé de téléphone ou créé un nouveau compte Telegram, contactez l'administrateur.",
+        )
+        await notifier_tentative_connexion(context, code, ancien_telegram_id, user_id)
+        return False
+
+    if statut == "banned" or user.get("banned", False):
+        await envoyer_message_acces(
+            update,
+            "🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.",
+        )
+        return False
+
+    return True
+
+
 @handler_securise
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -681,6 +861,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sauvegarder_users(data)
 
     code = user.get("code", "?")
+    journaliser_securite("connexion", code, user_id)
     vip = user.get("vip", False)
     restants = user.get("restants", 0)
     illimite = abonnement_actif(user)
@@ -1076,6 +1257,296 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @handler_securise
+async def resetdevice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/resetdevice CODE</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    data[uid_cible].pop("telegram_id", None)
+    sauvegarder_users(data)
+    await update.message.reply_text(
+        f"✅ Appareil réinitialisé pour <code>{echapper_html_texte(code_cible)}</code>.\n\n"
+        "Le prochain utilisateur qui lance <code>/start CODE</code> pourra associer ce compte.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@handler_securise
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/ban CODE</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    data[uid_cible]["banned"] = True
+    sauvegarder_users(data)
+    await update.message.reply_text(f"✅ Client <code>{echapper_html_texte(code_cible)}</code> banni.", parse_mode=ParseMode.HTML)
+    try:
+        await context.bot.send_message(
+            chat_id=int(uid_cible),
+            text="🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        logger.exception("Impossible de notifier le client banni %s.", uid_cible)
+
+
+@handler_securise
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/unban CODE</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    data[uid_cible]["banned"] = False
+    sauvegarder_users(data)
+    await update.message.reply_text(f"✅ Client <code>{echapper_html_texte(code_cible)}</code> débanni.", parse_mode=ParseMode.HTML)
+
+
+@handler_securise
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/info CODE</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    user = data[uid_cible]
+    appliquer_expiration_si_necessaire(user)
+    normaliser_signaux_restants(user)
+    sauvegarder_users(data)
+
+    try:
+        chat = await context.bot.get_chat(int(uid_cible))
+        nom = chat.full_name or chat.username or "Inconnu"
+    except TelegramError:
+        nom = "Inconnu"
+
+    if abonnement_actif(user):
+        statut = "VIP"
+        pack = "Abonnement mensuel"
+        signaux = "Illimité"
+    elif user.get("vip"):
+        statut = "VIP"
+        pack = "Pack VIP classique"
+        signaux = normaliser_signaux_vip(user)
+    else:
+        statut = "FREE"
+        pack = "Gratuit"
+        signaux = normaliser_signaux_gratuits(user)
+
+    vip_debut = user.get("vip_debut")
+    vip_fin = user.get("vip_fin")
+    texte = (
+        "━━━━━━━━━━━━━━━━━━\n"
+        "👤 <b>CLIENT</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>Nom Telegram</b>\n{echapper_html_texte(nom)}\n\n"
+        f"<b>Code client</b>\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
+        f"<b>Telegram ID</b>\n<code>{echapper_html_texte(user.get('telegram_id') or uid_cible)}</code>\n\n"
+        f"<b>Statut</b>\n{statut}\n\n"
+        f"<b>Nombre de signaux</b>\n{echapper_html_texte(signaux)}\n\n"
+        f"<b>Pack actuel</b>\n{echapper_html_texte(pack)}\n\n"
+        f"<b>Date de début</b>\n{echapper_html_texte(formater_date(vip_debut) if vip_debut else '-')}\n\n"
+        f"<b>Date d'expiration</b>\n{echapper_html_texte(formater_date(vip_fin) if vip_fin else '-')}\n\n"
+        f"<b>Jours restants</b>\n{jours_restants_jusqua(vip_fin) if vip_fin else 0}\n\n"
+        f"<b>Compte banni</b>\n{'Oui' if user.get('banned', False) else 'Non'}\n\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
+
+
+@handler_securise
+async def addsignal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if len(context.args) < 2 or not context.args[1].isdigit():
+        await update.message.reply_text("Usage : <code>/addsignal CODE NOMBRE</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    nombre = int(context.args[1])
+    if nombre <= 0 or nombre > 100000:
+        await update.message.reply_text("❌ Nombre de signaux invalide.", parse_mode=ParseMode.HTML)
+        return
+
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    user = data[uid_cible]
+    appliquer_expiration_si_necessaire(user)
+    actuel = normaliser_signaux_vip(user) if user.get("vip") else 0
+    total = actuel + nombre
+    normaliser_signaux_gratuits(user)
+    user["vip"] = True
+    user["illimite"] = False
+    user["vip_signals"] = total
+    user["restants"] = total
+    user.pop("vip_debut", None)
+    user.pop("vip_fin", None)
+    sauvegarder_users(data)
+
+    await update.message.reply_text(
+        f"✅ <b>{nombre}</b> signal{'s' if nombre > 1 else ''} ajouté{'s' if nombre > 1 else ''} au client <code>{echapper_html_texte(code_cible)}</code>.\n"
+        f"Il lui reste maintenant <b>{total}</b> signaux.",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=int(uid_cible),
+            text=(
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🎉 <b>Recharge effectuée</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "L'administrateur vient de vous ajouter :\n\n"
+                f"🎟 <b>{nombre}</b> signaux.\n\n"
+                "Il vous reste :\n\n"
+                f"🎟 <b>{total}</b> signaux.\n\n"
+                "Bonne utilisation.\n\n"
+                "━━━━━━━━━━━━━━━━━━"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        logger.exception("Impossible de notifier le client %s pour l'ajout de signaux.", uid_cible)
+
+
+@handler_securise
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/reset CODE</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    data[uid_cible] = {
+        "restants": SIGNAUX_DEFAUT,
+        "vip": False,
+        "code": code_cible,
+        "gratuits_deja_donnes": True,
+        "signaux_gratuits_restants": SIGNAUX_DEFAUT,
+        "vip_signals": 0,
+        "illimite": False,
+        "historique_signaux": [],
+        "messages": [],
+        "banned": False,
+    }
+    sauvegarder_users(data)
+    await update.message.reply_text(
+        f"✅ Client <code>{echapper_html_texte(code_cible)}</code> réinitialisé complètement.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@handler_securise
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    context.user_data["broadcast_waiting"] = True
+    await update.message.reply_text("✍️ Envoyez le message à diffuser.", parse_mode=ParseMode.HTML)
+
+
+@handler_securise
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("broadcast_waiting"):
+        return
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    context.user_data["broadcast_waiting"] = False
+    data = migrer_si_besoin(charger_users())
+    envoyes = 0
+    echecs = 0
+
+    for uid, user in data.items():
+        if not isinstance(user, dict) or user.get("banned", False):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=int(user.get("telegram_id") or uid),
+                text=update.message.text,
+            )
+            envoyes += 1
+        except TelegramError:
+            echecs += 1
+        except (TypeError, ValueError):
+            echecs += 1
+
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📢 <b>Diffusion terminée</b>\n\n"
+        f"Envoyé :\n<b>{envoyes}</b> utilisateurs\n\n"
+        f"Échec :\n<b>{echecs}</b> utilisateurs\n"
+        "━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@handler_securise
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
         await refuser_non_admin(update)
@@ -1128,6 +1599,13 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/devip CODE</code> — Retire le statut VIP d'un client\n"
         "<code>/abonnement CODE</code> — Abonnement VIP illimité 30j\n"
         "<code>/desabo CODE</code> — Coupe l'abonnement mensuel d'un client\n"
+        "<code>/resetdevice CODE</code> — Réinitialise le Telegram ID associé\n"
+        "<code>/ban CODE</code> — Bannit définitivement un client\n"
+        "<code>/unban CODE</code> — Retire le bannissement\n"
+        "<code>/info CODE</code> — Affiche la fiche complète du client\n"
+        "<code>/addsignal CODE NOMBRE</code> — Ajoute des signaux au solde\n"
+        "<code>/reset CODE</code> — Réinitialise complètement un client\n"
+        "<code>/broadcast</code> — Diffuse un message à tous les utilisateurs\n"
         "<code>/admin</code> — Affiche ce menu",
         parse_mode=ParseMode.HTML,
     )
@@ -1318,7 +1796,7 @@ async def vip_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
     
-    msg = await remplacer_message(
+    msg = await modifier_message(
         query,
         "💎 <b>ESPACE VIP & SUPPORT</b>\n\n"
         "Sélectionne une option :",
@@ -1352,7 +1830,7 @@ async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
     
-    msg = await remplacer_message(
+    msg = await modifier_message(
         query,
         "💎 <b>PACKS VIP</b>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1370,6 +1848,7 @@ async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Wave / Moov Money\n\n"
         "<b>📞 Contact Admin</b>\n"
         f"{admin_username_html()}",
+        bouton_vip_pack(),
     )
     sauvegarder_message_id(user_id, msg.message_id)
 
@@ -1577,7 +2056,15 @@ def creer_application():
     app.add_handler(CommandHandler("abonnement", abonnement_cmd))
     app.add_handler(CommandHandler("devip", desactiver_vip_cmd))
     app.add_handler(CommandHandler("desabo", desabonner_cmd))
+    app.add_handler(CommandHandler("resetdevice", resetdevice_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("info", info_cmd))
+    app.add_handler(CommandHandler("addsignal", addsignal_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("admin", admin_help))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_message))
     
     # Handlers de callback - Menu principal
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
