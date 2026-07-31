@@ -1,7 +1,6 @@
 ﻿import datetime
 import asyncio
 import html
-import importlib
 import json
 import logging
 import os
@@ -13,6 +12,8 @@ from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from json import JSONDecodeError
 
+from psycopg_pool import ConnectionPool
+from psycopg.types.json import Jsonb
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -59,7 +60,6 @@ storage_lock = threading.RLock()
 storage_cache = {}
 db_pool = None
 db_initialized = False
-Jsonb = None
 analyses_lock = threading.Lock()
 analyses_en_cours = set()
 signal_history_lock = threading.Lock()
@@ -94,15 +94,12 @@ def lire_json_migration(path, default):
 
 
 def get_db_pool():
-    global db_pool, Jsonb
+    global db_pool
     if db_pool is None:
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
             raise RuntimeError("DATABASE_URL est obligatoire pour utiliser le stockage PostgreSQL.")
-        PsycopgConnectionPool = importlib.import_module("psycopg_pool").ConnectionPool
-        PsycopgJsonb = importlib.import_module("psycopg.types.json").Jsonb
-        Jsonb = PsycopgJsonb
-        db_pool = PsycopgConnectionPool(database_url, min_size=1, max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")))
+        db_pool = ConnectionPool(database_url, min_size=1, max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")))
     return db_pool
 
 

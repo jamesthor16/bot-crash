@@ -1,7 +1,6 @@
 ﻿import datetime
 import asyncio
 import html
-import importlib
 import json
 import logging
 import os
@@ -13,6 +12,8 @@ from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from json import JSONDecodeError
 
+from psycopg_pool import ConnectionPool
+from psycopg.types.json import Jsonb
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -37,8 +38,7 @@ COOLDOWN_SECONDS = 30
 ANALYSE_MIN_SECONDS = 8
 ANALYSE_MAX_SECONDS = 15
 HISTORIQUE_LIMIT = 100
-SIGNAL_MEMORY_LIMIT = 20
-OPPORTUNITE_REFUS_PROBABILITY = 0.07
+OPPORTUNITE_REFUS_PROBABILITY = 0.12
 
 
 def admin_username_html():
@@ -59,11 +59,8 @@ storage_lock = threading.RLock()
 storage_cache = {}
 db_pool = None
 db_initialized = False
-Jsonb = None
 analyses_lock = threading.Lock()
 analyses_en_cours = set()
-signal_history_lock = threading.Lock()
-derniers_signaux_generes = []
 
 
 def copie_defaut(default):
@@ -94,15 +91,12 @@ def lire_json_migration(path, default):
 
 
 def get_db_pool():
-    global db_pool, Jsonb
+    global db_pool
     if db_pool is None:
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
             raise RuntimeError("DATABASE_URL est obligatoire pour utiliser le stockage PostgreSQL.")
-        PsycopgConnectionPool = importlib.import_module("psycopg_pool").ConnectionPool
-        PsycopgJsonb = importlib.import_module("psycopg.types.json").Jsonb
-        Jsonb = PsycopgJsonb
-        db_pool = PsycopgConnectionPool(database_url, min_size=1, max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")))
+        db_pool = ConnectionPool(database_url, min_size=1, max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")))
     return db_pool
 
 
@@ -467,75 +461,9 @@ def normaliser_signaux_vip(user):
     return user["vip_signals"]
 
 
-def date_limite_journaliere():
-    return datetime.datetime.now().strftime("%Y-%m-%d")
-
-
-def normaliser_limite_journaliere(user):
-    limite = entier_positif(user.get("daily_limit_max", 0))
-    active = bool(user.get("daily_limit_enabled")) and limite > 0
-    aujourd_hui = date_limite_journaliere()
-
-    if not active:
-        user["daily_limit_enabled"] = False
-        user["daily_limit_max"] = 0
-        user["daily_used"] = 0
-        user["daily_limit_date"] = aujourd_hui
-        return 0, 0, False
-
-    if user.get("daily_limit_date") != aujourd_hui:
-        user["daily_used"] = 0
-        user["daily_limit_date"] = aujourd_hui
-
-    user["daily_limit_enabled"] = True
-    user["daily_limit_max"] = limite
-    user["daily_used"] = entier_positif(user.get("daily_used", 0), maximum=limite)
-    return user["daily_used"], limite, True
-
-
-def configurer_limite_journaliere(user, limite=None):
-    if limite and limite > 0:
-        user["daily_limit_enabled"] = True
-        user["daily_limit_max"] = int(limite)
-        user["daily_used"] = 0
-        user["daily_limit_date"] = date_limite_journaliere()
-    else:
-        user["daily_limit_enabled"] = False
-        user["daily_limit_max"] = 0
-        user["daily_used"] = 0
-        user["daily_limit_date"] = date_limite_journaliere()
-
-
-def supprimer_limite_journaliere(user):
-    user.pop("daily_limit_enabled", None)
-    user.pop("daily_limit_max", None)
-    user.pop("daily_used", None)
-    user.pop("daily_limit_date", None)
-
-
-def limite_journaliere_atteinte(user):
-    utilises, limite, active = normaliser_limite_journaliere(user)
-    return active and utilises >= limite
-
-
-def texte_limite_journaliere(user):
-    utilises, limite, active = normaliser_limite_journaliere(user)
-    if not active:
-        return "📅 Limite quotidienne\nNon activée"
-    return f"📅 Limite quotidienne\n<b>{utilises} / {limite}</b> utilisés aujourd'hui"
-
-
-def texte_limite_atteinte():
-    return (
-        "⛔ <b>Vous avez atteint votre limite quotidienne.</b>\n\n"
-        "Revenez demain pour obtenir de nouveaux signaux."
-    )
-
-
 def normaliser_signaux_restants(user):
     gratuits = normaliser_signaux_gratuits(user)
     vip_signals = normaliser_signaux_vip(user)
-    normaliser_limite_journaliere(user)
 
     if abonnement_actif(user):
         user["vip"] = True
@@ -558,7 +486,6 @@ def remettre_en_mode_gratuit(user):
     user["illimite"] = False
     user["restants"] = gratuits
     user["vip_signals"] = 0
-    supprimer_limite_journaliere(user)
     user.pop("vip_debut", None)
     user.pop("vip_fin", None)
     return gratuits
@@ -596,8 +523,6 @@ def migrer_si_besoin(data):
         if "banned" not in user:
             user["banned"] = False
 
-        normaliser_limite_journaliere(user)
-
         if "messages" in user and not isinstance(user["messages"], list):
             user["messages"] = []
 
@@ -619,8 +544,6 @@ def migrer_si_besoin(data):
 
 
 def peut_obtenir_signal(user):
-    if limite_journaliere_atteinte(user):
-        return False
     if abonnement_actif(user):
         return True
     return normaliser_signaux_restants(user) > 0
@@ -721,16 +644,10 @@ def consommer_signal(user_id, signal_txt=None):
 
     user = data[uid]
     appliquer_expiration_si_necessaire(user)
-    if limite_journaliere_atteinte(user):
-        sauvegarder_users(data)
-        return {"restants": user.get("restants"), "mode": "limite_journaliere", "illimite": abonnement_actif(user)}
 
     if abonnement_actif(user):
         user["dernier_signal"] = datetime.datetime.now().timestamp()
         user["illimite"] = True
-        utilises, limite, active = normaliser_limite_journaliere(user)
-        if active:
-            user["daily_used"] = min(limite, utilises + 1)
         if signal_txt:
             ajouter_historique_signal(user, signal_txt, "abonnement")
         sauvegarder_users(data)
@@ -755,9 +672,6 @@ def consommer_signal(user_id, signal_txt=None):
         restants_apres = gratuits
 
     user["dernier_signal"] = datetime.datetime.now().timestamp()
-    utilises, limite, active = normaliser_limite_journaliere(user)
-    if active:
-        user["daily_used"] = min(limite, utilises + 1)
     if signal_txt:
         ajouter_historique_signal(user, signal_txt, mode)
     sauvegarder_users(data)
@@ -798,14 +712,12 @@ def niveau_depuis_coefficient(coefficient):
 
 
 def texte_compteur_compte(user):
-    limite = texte_limite_journaliere(user)
     if abonnement_actif(user):
         return (
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
             "ðŸ‘‘ <b>Compte Premium</b>\n\n"
             "ðŸŽŸ Signaux restants\n"
-            "â™¾ï¸ IllimitÃ©\n\n"
-            f"{limite}\n"
+            "â™¾ï¸ IllimitÃ©\n"
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
         )
 
@@ -815,8 +727,7 @@ def texte_compteur_compte(user):
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
             "ðŸ‘‘ <b>Compte Premium</b>\n\n"
             "ðŸŽŸ Signaux restants\n"
-            f"<b>{restants}</b>\n\n"
-            f"{limite}\n"
+            f"<b>{restants}</b>\n"
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
         )
 
@@ -861,24 +772,13 @@ def ajouter_historique_signal(user, signal_txt, statut):
     user["historique_signaux"] = historique[-HISTORIQUE_LIMIT:]
 
 
-def memoriser_signal_interne(coefficient):
-    with signal_history_lock:
-        derniers_signaux_generes.append(float(coefficient))
-        del derniers_signaux_generes[:-SIGNAL_MEMORY_LIMIT]
-
-
-def derniers_multiplicateurs(user, limite=SIGNAL_MEMORY_LIMIT):
-    valeurs = []
+def derniers_multiplicateurs(user, limite=8):
+    valeurs = set()
     for entree in user.get("historique_signaux", [])[-limite:]:
         signal = entree.get("signal", "")
         match = re.search(r"Multiplicateur</b>\n<code>([0-9]+(?:\.[0-9]+)?)x</code>", signal)
         if match:
-            try:
-                valeurs.append(float(match.group(1)))
-            except ValueError:
-                continue
-    with signal_history_lock:
-        valeurs.extend(derniers_signaux_generes[-limite:])
+            valeurs.add(match.group(1))
     return valeurs
 
 
@@ -897,11 +797,11 @@ def opportunite_marche_disponible(user):
             dernieres_minutes += 1
 
     if dernieres_minutes >= 3:
-        refus_probability += 0.02
+        refus_probability += 0.03
     if maintenant.minute in {0, 1, 29, 30, 31, 58, 59}:
-        refus_probability += 0.01
+        refus_probability += 0.02
 
-    return random.random() >= min(refus_probability, 0.10)
+    return random.random() >= min(refus_probability, 0.15)
 
 
 def barre_progression(pourcentage):
@@ -909,52 +809,34 @@ def barre_progression(pourcentage):
     return f"{'\u2588' * blocs}{'\u2591' * (10 - blocs)} {pourcentage}%"
 
 
-def texte_analyse(etape, pourcentage, titres=None):
-    titres = titres or [
+def texte_analyse(etape, pourcentage):
+    titres = [
         "\U0001f680 Connexion au serveur Crash...",
         "\U0001f4ca Analyse des derniers Crash...",
         "\U0001f9e0 Calcul du multiplicateur...",
         "\u2699\ufe0f Validation du signal...",
         "\u2705 Analyse termin\u00e9e.",
     ]
-    total = len(titres)
-    points = "\u25cf" * (etape + 1) + "\u25cb" * max(0, total - etape - 1)
+    points = "\u25cf" * (etape + 1) + "\u25cb" * (4 - etape)
     return (
         "\u2501" * 22 + "\n"
         "\U0001f4a5 <b>ANALYSE CRASH AI</b>\n"
         + "\u2501" * 22 + "\n\n"
-        f"{titres[min(etape, total - 1)]}\n\n"
+        f"{titres[etape]}\n\n"
         f"<code>{points}</code>\n\n"
         f"<code>{barre_progression(pourcentage)}</code>"
     )
 
 async def lancer_animation_analyse(query, user_id):
     total = random.uniform(ANALYSE_MIN_SECONDS, ANALYSE_MAX_SECONDS)
-    etapes = random.choice(
-        [
-            [20, 45, 70, 100],
-            [30, 60, 90, 100],
-            [15, 40, 68, 88, 100],
-            [25, 50, 75, 100],
-        ]
-    )
-    titres_disponibles = [
-        "\U0001f680 Connexion au serveur Crash...",
-        "\U0001f4e1 Synchronisation des données...",
-        "\U0001f4ca Analyse des derniers Crash...",
-        "\U0001f9e0 Calcul du multiplicateur...",
-        "\u2699\ufe0f Vérification des probabilités...",
-        "\U0001f4c8 Analyse des tendances...",
-        "\U0001f50d Recherche d'une opportunité...",
-    ]
-    titres = random.sample(titres_disponibles, k=len(etapes) - 1) + ["\u2705 Validation finale..."]
-    poids = [1 / (len(etapes) - 1)] * (len(etapes) - 1)
+    etapes = [10, 30, 60, 85, 100]
+    poids = [0.22, 0.27, 0.25, 0.26]
     variations = [random.uniform(0.85, 1.15) for _ in poids]
     delais = [poids[i] * variations[i] for i in range(len(poids))]
     facteur = total / sum(delais)
 
     message = await query.message.reply_text(
-        texte_analyse(0, etapes[0], titres),
+        texte_analyse(0, etapes[0]),
         parse_mode=ParseMode.HTML,
     )
     sauvegarder_message_id(user_id, message.message_id)
@@ -963,7 +845,7 @@ async def lancer_animation_analyse(query, user_id):
         await asyncio.sleep(delais[index - 1] * facteur)
         try:
             await message.edit_text(
-                texte_analyse(index, etapes[index], titres),
+                texte_analyse(index, etapes[index]),
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
@@ -977,52 +859,31 @@ def delai_signal_depuis_coefficient(coefficient):
         return 4
     if coefficient >= 2.70:
         return 5
-    if coefficient >= 2.25:
+    if coefficient >= 2.30:
         return 6
     return 7
 
 
-def generer_multiplicateur_pondere():
-    plage = random.choices(
-        population=[
-            (2.00, 2.30),
-            (2.31, 2.80),
-            (2.81, 3.20),
-            (3.21, 3.50),
-        ],
-        weights=[45, 35, 15, 5],
-        k=1,
-    )[0]
-    return round(random.uniform(*plage), 2)
-
-
-def multiplicateur_trop_proche(coefficient, deja_vus):
-    return any(abs(float(coefficient) - float(valeur)) < 0.06 for valeur in deja_vus[-6:])
-
-
-def generer_assurance_intelligente(coefficient):
-    ratio = (coefficient - 2.00) / 1.50
-    centre = 1.62 + (ratio * 0.72)
-    assurance = random.gauss(centre, 0.14)
-    assurance = max(1.50, min(2.50, assurance))
-    assurance = min(assurance, coefficient - 0.22)
-    return round(max(1.50, min(2.50, assurance)), 2)
-
-
 def generer_signal(user=None):
     heure_date = datetime.datetime.now()
+    heure_minute = heure_date.minute
+    heure_hour = heure_date.hour
+
+    if 16 <= heure_hour < 17:
+        return "\u23f3 <b>Analyse en cours...</b>\n\nVeuillez r\u00e9essayer dans une heure.", False
+    if 13 <= heure_minute < 14:
+        return "\U0001f504 <b>Intervalle de jeu d\u00e9tect\u00e9.</b>\nVeuillez r\u00e9essayer dans une heure.", False
 
     deja_vus = derniers_multiplicateurs(user or {})
-    coefficient_number = generer_multiplicateur_pondere()
-    for _ in range(20):
-        if not multiplicateur_trop_proche(coefficient_number, deja_vus):
+    coefficient_number = round(random.uniform(2.00, 3.50), 2)
+    for _ in range(12):
+        if f"{coefficient_number:.2f}" not in deja_vus:
             break
-        coefficient_number = generer_multiplicateur_pondere()
+        coefficient_number = round(random.uniform(2.00, 3.50), 2)
 
-    assurance = generer_assurance_intelligente(coefficient_number)
+    assurance = round(random.uniform(1.50, 2.50), 2)
     heure_date = heure_date + datetime.timedelta(minutes=delai_signal_depuis_coefficient(coefficient_number))
     separateur = "\u2501" * 22
-    memoriser_signal_interne(coefficient_number)
 
     message = (
         f"{separateur}\n"
@@ -1039,22 +900,6 @@ def generer_signal(user=None):
         f"{separateur}"
     )
     return message, True
-
-
-def texte_restant_apres_signal(user, etat):
-    if etat.get("illimite"):
-        ligne = "👑 Il vous reste ♾️ signaux VIP."
-    elif etat.get("mode") == "vip":
-        restants = entier_positif(etat.get("restants", 0))
-        ligne = f"👑 Il vous reste {restants} signaux VIP."
-    else:
-        restants = entier_positif(etat.get("restants", 0))
-        ligne = f"🎟 Il vous reste {restants} signaux."
-
-    utilises, limite, active = normaliser_limite_journaliere(user)
-    if active:
-        ligne += f"\n\n📅 Limite quotidienne\n{utilises} / {limite} utilisés aujourd'hui"
-    return ligne
 
 # ===== MENUS RESTRUCTURÃ‰S =====
 
@@ -1348,137 +1193,6 @@ async def mon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def bouton_choix_limite_journaliere():
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Oui", callback_data="daily_limit_yes"),
-                InlineKeyboardButton("❌ Non", callback_data="daily_limit_no"),
-            ]
-        ]
-    )
-
-
-async def demander_limite_journaliere(update, code_cible, operation, nombre=None):
-    details = f"\n\nSignaux : <b>{nombre}</b>" if nombre is not None else ""
-    await update.message.reply_text(
-        "Souhaitez-vous activer une limitation quotidienne ?\n"
-        f"Client : <code>{echapper_html_texte(code_cible)}</code>{details}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=bouton_choix_limite_journaliere(),
-    )
-
-
-async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, limite_jour=None):
-    data = migrer_si_besoin(charger_users())
-    uid_cible = trouver_uid_par_code(data, code_cible)
-    if uid_cible is None:
-        await context.bot.send_message(
-            chat_id=admin_chat_id,
-            text=f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    user_cible = data[uid_cible]
-    user_cible["restants"] = nombre
-    user_cible["vip_signals"] = nombre
-    user_cible["illimite"] = False
-    user_cible.pop("vip_debut", None)
-    user_cible.pop("vip_fin", None)
-    configurer_limite_journaliere(user_cible, limite_jour)
-    sauvegarder_users(data)
-
-    limite_txt = (
-        f"\n📅 Limite quotidienne : <b>{limite_jour}</b> signal{'s' if limite_jour and limite_jour > 1 else ''} / jour"
-        if limite_jour
-        else "\n📅 Limite quotidienne : <b>Non activée</b>"
-    )
-    await context.bot.send_message(
-        chat_id=admin_chat_id,
-        text=(
-            f"✅ Client <code>{echapper_html_texte(code_cible)}</code> rechargé avec <b>{nombre}</b> signal{'s' if nombre > 1 else ''} VIP.\n"
-            f"👑 Il lui reste maintenant <b>{nombre}</b> signaux VIP."
-            f"{limite_txt}"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=int(uid_cible),
-            text=(
-                "🎉 Bonne nouvelle !\n\n"
-                "Tes signaux VIP ont été rechargés par l'administrateur.\n"
-                f"👑 Il vous reste <b>{nombre}</b> signaux VIP."
-                f"{limite_txt}\n\n"
-                "Appuie sur /start pour continuer."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        logger.exception("Impossible de notifier le client %s.", uid_cible)
-
-
-async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_jour=None):
-    data = migrer_si_besoin(charger_users())
-    uid_cible = trouver_uid_par_code(data, code_cible)
-    if uid_cible is None:
-        await context.bot.send_message(
-            chat_id=admin_chat_id,
-            text=f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    maintenant = datetime.datetime.now()
-    fin = maintenant + datetime.timedelta(days=30)
-    user_cible = data[uid_cible]
-    normaliser_signaux_gratuits(user_cible)
-    user_cible["vip"] = True
-    user_cible["illimite"] = True
-    user_cible["vip_debut"] = maintenant.timestamp()
-    user_cible["vip_fin"] = fin.timestamp()
-    user_cible["vip_signals"] = 0
-    user_cible["restants"] = None
-    configurer_limite_journaliere(user_cible, limite_jour)
-    sauvegarder_users(data)
-
-    limite_txt = (
-        f"\n📅 Limite quotidienne : <b>{limite_jour}</b> signal{'s' if limite_jour and limite_jour > 1 else ''} / jour"
-        if limite_jour
-        else "\n📅 Limite quotidienne : <b>Non activée</b>"
-    )
-    await context.bot.send_message(
-        chat_id=admin_chat_id,
-        text=(
-            f"✅ Abonnement mensuel activé pour <code>{echapper_html_texte(code_cible)}</code> 👑\n\n"
-            "♾️ Signaux illimités activés immédiatement.\n"
-            f"{limite_txt}\n\n"
-            f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
-            f"📆 Fin : <b>{fin.strftime('%d/%m/%Y')}</b>"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=int(uid_cible),
-            text=(
-                "🎉 Ton abonnement <b>VIP</b> est activé ! 👑\n\n"
-                f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
-                f"📆 Expire le : <b>{fin.strftime('%d/%m/%Y')}</b>\n"
-                "⏳ Durée : <b>30 jours</b>\n"
-                "♾️ Signaux illimités"
-                f"{limite_txt}\n\n"
-                "Tape /start pour voir ton abonnement."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        logger.exception("Impossible de notifier le client %s.", uid_cible)
-
-
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -1535,14 +1249,6 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    context.user_data["daily_limit_pending"] = {
-        "operation": "recharge",
-        "code": code_cible,
-        "nombre": nombre,
-    }
-    await demander_limite_journaliere(update, code_cible, "recharge", nombre=nombre)
-    return
-
     user_cible["restants"] = nombre
     user_cible["vip_signals"] = nombre
     user_cible["illimite"] = False
@@ -1594,17 +1300,14 @@ async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vip_debut = user.get("vip_debut")
             vip_fin = user.get("vip_fin")
             jours_restants = jours_restants_jusqua(vip_fin)
-            limite = texte_limite_journaliere(user).replace("\n", " : ")
             ligne = (
                 f"ðŸ’Ž <code>{echapper_html_texte(code)}</code> â€” Abonnement VIP illimitÃ©\n"
                 f"   ðŸ’³ DÃ©but : {echapper_html_texte(formater_date(vip_debut))}\n"
-                f"   ðŸ“† Expire le : {echapper_html_texte(formater_date(vip_fin))} ({jours_restants}j restants)\n"
-                f"   {limite}"
+                f"   ðŸ“† Expire le : {echapper_html_texte(formater_date(vip_fin))} ({jours_restants}j restants)"
             )
         elif user.get("vip"):
             restants = normaliser_signaux_vip(user)
-            limite = texte_limite_journaliere(user).replace("\n", " : ")
-            ligne = f"ðŸ‘‘ <code>{echapper_html_texte(code)}</code> â€” VIP classique â€” {restants} signal{'s' if restants > 1 else ''} VIP â€” {limite}"
+            ligne = f"ðŸ‘‘ <code>{echapper_html_texte(code)}</code> â€” VIP classique â€” {restants} signal{'s' if restants > 1 else ''} VIP"
         else:
             restants = normaliser_signaux_gratuits(user)
             ligne = f"ðŸ†“ <code>{echapper_html_texte(code)}</code> â€” Gratuit â€” {restants} signal{'s' if restants > 1 else ''} gratuit{'s' if restants > 1 else ''}"
@@ -1679,13 +1382,6 @@ async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid_cible is None:
         await update.message.reply_text(f"âŒ Aucun client trouvÃ© avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
-
-    context.user_data["daily_limit_pending"] = {
-        "operation": "abonnement",
-        "code": code_cible,
-    }
-    await demander_limite_journaliere(update, code_cible, "abonnement")
-    return
 
     maintenant = datetime.datetime.now()
     fin = maintenant + datetime.timedelta(days=30)
@@ -1947,7 +1643,6 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Statut</b>\n{statut}\n\n"
         f"<b>Nombre de signaux</b>\n{echapper_html_texte(signaux)}\n\n"
         f"<b>Pack actuel</b>\n{echapper_html_texte(pack)}\n\n"
-        f"<b>Limite quotidienne</b>\n{texte_limite_journaliere(user).replace(chr(10), ' : ')}\n\n"
         f"<b>Date de dÃ©but</b>\n{echapper_html_texte(formater_date(vip_debut) if vip_debut else '-')}\n\n"
         f"<b>Date d'expiration</b>\n{echapper_html_texte(formater_date(vip_fin) if vip_fin else '-')}\n\n"
         f"<b>Jours restants</b>\n{jours_restants_jusqua(vip_fin) if vip_fin else 0}\n\n"
@@ -2066,74 +1761,8 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("âœï¸ Envoyez le message Ã  diffuser.", parse_mode=ParseMode.HTML)
 
 
-async def finaliser_action_limite_journaliere(context, chat_id, pending, limite_jour=None):
-    operation = pending.get("operation")
-    code_cible = pending.get("code")
-    if operation == "recharge":
-        await appliquer_recharge_admin(context, chat_id, code_cible, int(pending.get("nombre", 0)), limite_jour)
-    elif operation == "abonnement":
-        await appliquer_abonnement_admin(context, chat_id, code_cible, limite_jour)
-
-
-@handler_securise
-async def choix_limite_journaliere_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not est_admin(update):
-        await refuser_non_admin(update)
-        return
-
-    query = update.callback_query
-    await query.answer()
-    pending = context.user_data.get("daily_limit_pending")
-    if not pending:
-        await query.edit_message_text("Aucune action en attente.", parse_mode=ParseMode.HTML)
-        return
-
-    if query.data == "daily_limit_no":
-        context.user_data.pop("daily_limit_pending", None)
-        await query.edit_message_text("Limitation quotidienne desactivee. Application en cours...", parse_mode=ParseMode.HTML)
-        await finaliser_action_limite_journaliere(context, query.message.chat_id, pending, limite_jour=None)
-        return
-
-    context.user_data["daily_limit_waiting_number"] = True
-    await query.edit_message_text(
-        "Combien de signaux maximum par jour ?\n\n"
-        "Exemple : <code>5</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@handler_securise
-async def limite_journaliere_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("daily_limit_waiting_number"):
-        return False
-    if not est_admin(update):
-        await refuser_non_admin(update)
-        return True
-
-    texte = (update.message.text or "").strip()
-    if not texte.isdigit():
-        await update.message.reply_text("Envoyez uniquement un nombre. Exemple : <code>5</code>", parse_mode=ParseMode.HTML)
-        return True
-
-    limite_jour = int(texte)
-    if limite_jour <= 0 or limite_jour > 100000:
-        await update.message.reply_text("Limite quotidienne invalide.", parse_mode=ParseMode.HTML)
-        return True
-
-    pending = context.user_data.get("daily_limit_pending")
-    context.user_data.pop("daily_limit_pending", None)
-    context.user_data.pop("daily_limit_waiting_number", None)
-    if not pending:
-        await update.message.reply_text("Aucune action en attente.", parse_mode=ParseMode.HTML)
-        return True
-
-    await finaliser_action_limite_journaliere(context, update.effective_chat.id, pending, limite_jour=limite_jour)
-    return True
-
 @handler_securise
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await limite_journaliere_message(update, context):
-        return
     if not context.user_data.get("broadcast_waiting"):
         return
     if not est_admin(update):
@@ -2182,7 +1811,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     abonnements = sum(1 for u in utilisateurs if abonnement_actif(u))
     vip_classiques = sum(1 for u in utilisateurs if u.get("vip") and not abonnement_actif(u))
     gratuits = total - abonnements - vip_classiques
-    limites_actives = sum(1 for u in utilisateurs if normaliser_limite_journaliere(u)[2])
 
     bientot = []
     maintenant = datetime.datetime.now()
@@ -2197,8 +1825,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ðŸ‘¥ Total clients : {total}\n"
         f"ðŸ’Ž Abonnements VIP illimitÃ©s : {abonnements}\n"
         f"ðŸ‘‘ VIP classiques : {vip_classiques}\n"
-        f"ðŸ†“ Membres gratuits : {gratuits}\n"
-        f"📅 Limites quotidiennes actives : {limites_actives}"
+        f"ðŸ†“ Membres gratuits : {gratuits}"
     )
     if bientot:
         texte += "\n\nâš ï¸ <b>Abonnements qui expirent bientÃ´t :</b>"
@@ -2286,20 +1913,6 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
-        if limite_journaliere_atteinte(user):
-            sauvegarder_users(data)
-            msg = await remplacer_message(
-                query,
-                texte_limite_atteinte(),
-                bouton_signal(
-                    restants=user.get("restants"),
-                    vip=user.get("vip", False),
-                    illimite=abonnement_actif(user),
-                ),
-            )
-            sauvegarder_message_id(user_id, msg.message_id)
-            return
-
         if not peut_obtenir_signal(user):
             msg = await remplacer_message(
                 query,
@@ -2325,20 +1938,6 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
-        if limite_journaliere_atteinte(user):
-            sauvegarder_users(data)
-            msg = await remplacer_message(
-                query,
-                texte_limite_atteinte(),
-                bouton_signal(
-                    restants=user.get("restants"),
-                    vip=user.get("vip", False),
-                    illimite=abonnement_actif(user),
-                ),
-            )
-            sauvegarder_message_id(user_id, msg.message_id)
-            return
-
         if not peut_obtenir_signal(user):
             msg = await remplacer_message(
                 query,
@@ -2351,9 +1950,9 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not opportunite_marche_disponible(user):
             msg = await remplacer_message(
                 query,
-                "⚠️ <b>Analyse du marché en cours...</b>\n\n"
-                "Aucune opportunité détectée.\n\n"
-                "Réessayez dans quelques minutes.",
+                "âš ï¸ <b>Analyse du marchÃ© en cours.</b>\n\n"
+                "Aucune opportunitÃ© fiable dÃ©tectÃ©e.\n\n"
+                "RÃ©essaie dans 4 minutes.",
                 bouton_signal(
                     restants=user.get("restants"),
                     vip=user.get("vip", False),
@@ -2391,15 +1990,13 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         etat = consommer_signal(user_id, signal_txt=signal_txt)
-        data_apres = charger_users()
-        user_apres = data_apres.get(uid, user)
         if etat["illimite"]:
-            texte = f"{signal_txt}\n\n{texte_restant_apres_signal(user_apres, etat)}"
+            texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
             markup = bouton_signal(vip=True, illimite=True)
         elif etat["mode"] == "vip":
             restants_apres = etat["restants"]
             if restants_apres > 0:
-                texte = f"{signal_txt}\n\n{texte_restant_apres_signal(user_apres, etat)}"
+                texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
                 markup = bouton_signal(restants=restants_apres, vip=True)
             else:
                 texte = (
@@ -2411,7 +2008,7 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             restants_apres = etat["restants"]
             if restants_apres > 0:
-                texte = f"{signal_txt}\n\n{texte_restant_apres_signal(user_apres, etat)}"
+                texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
                 markup = bouton_signal(restants=restants_apres)
             else:
                 texte = (
@@ -2547,24 +2144,20 @@ async def abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     sauvegarder_users(data)
 
     if abonnement_actif(user):
-        limite = texte_limite_journaliere(user)
         texte = (
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
             "ðŸ‘‘ <b>Mon abonnement</b>\n\n"
             f"ðŸ“… DÃ©but\n<b>{echapper_html_texte(formater_date(user.get('vip_debut')))}</b>\n\n"
             "ðŸŽŸ Signaux\n<b>â™¾ï¸ IllimitÃ©</b>\n\n"
-            f"{limite}\n\n"
             f"ðŸ“† Expiration\n<b>{echapper_html_texte(formater_date(user.get('vip_fin')))}</b>\n"
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
         )
     elif user.get("vip"):
-        limite = texte_limite_journaliere(user)
         texte = (
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
             "ðŸ‘‘ <b>VIP classique</b>\n\n"
             "ðŸŽŸ Signaux restants\n"
-            f"<b>{normaliser_signaux_vip(user)}</b>\n\n"
-            f"{limite}\n"
+            f"<b>{normaliser_signaux_vip(user)}</b>\n"
             "â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
         )
     else:
@@ -2726,7 +2319,6 @@ def creer_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_message))
     
     # Handlers de callback - Menu principal
-    app.add_handler(CallbackQueryHandler(choix_limite_journaliere_callback, pattern="^daily_limit_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
     app.add_handler(CallbackQueryHandler(compte_menu_callback, pattern="^compte_menu$"))
     app.add_handler(CallbackQueryHandler(vip_menu_callback, pattern="^vip_menu$"))
@@ -2765,5 +2357,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
