@@ -41,6 +41,21 @@ HISTORIQUE_LIMIT = 100
 SIGNAL_MEMORY_LIMIT = 20
 OPPORTUNITE_REFUS_PROBABILITY = 0.07
 
+# Configuration du groupe de journalisation (0 = désactivé)
+LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))  # mettre -100... dans l'env pour activer
+SALES_LOG_KEY = "sales_log"
+
+# Configuration des prix (modifiable)
+# Packs affichés dans le menu :
+# 100 -> 2000 FCFA, 250 -> 4000 FCFA, 500 -> 7000 FCFA, abonnement mensuel -> 12000 FCFA
+PACK_PRICES = {
+    100: 2000,
+    250: 4000,
+    500: 7000,
+}
+DEFAULT_PRICE_PER_SIGNAL = 20  # si le nombre n'est pas un pack connu, prix par signal par défaut (FCFA)
+ABONNEMENT_PRICE = 12000  # prix fixe pour abonnement mensuel (FCFA)
+
 
 def admin_username_html():
     return f"@{html.escape(ADMIN_USERNAME)}"
@@ -49,6 +64,13 @@ def admin_username_html():
 def echapper_html_texte(texte):
     """Échappe les caractères HTML spéciaux pour une utilisation sûre en ParseMode.HTML"""
     return html.escape(str(texte), quote=True)
+
+
+def format_fcfa(n):
+    try:
+        return f"{int(n):,}".replace(",", " ")
+    except Exception:
+        return str(n)
 
 
 logging.basicConfig(
@@ -439,6 +461,72 @@ def charger_journal_securite():
 def sauvegarder_journal_securite(journal):
     ecrire_json(SECURITY_LOG_FILE, journal[-1000:])
 
+# --- Journal des ventes (recharges & abonnements) et notifications de groupe ---
+def charger_journal_ventes():
+    journal = lire_json(SALES_LOG_KEY, [])
+    return journal if isinstance(journal, list) else []
+
+def sauvegarder_journal_ventes(journal):
+    # garder les dernières entrées pour éviter saturation
+    ecrire_json(SALES_LOG_KEY, journal[-10000:])
+
+def calculer_prix_recharge(nombre):
+    """
+    Calcule le prix (FCFA) pour une recharge de `nombre` signaux.
+    - si `nombre` correspond exactement à un pack connu (100/250/500), on utilise PACK_PRICES
+    - sinon on utilise DEFAULT_PRICE_PER_SIGNAL * nombre
+    """
+    try:
+        n = int(nombre)
+    except Exception:
+        return 0
+    if n in PACK_PRICES:
+        return PACK_PRICES[n]
+    return int(n * DEFAULT_PRICE_PER_SIGNAL)
+
+def journaliser_recharge(code_client, nombre, admin_name, price_fcfa=None):
+    if price_fcfa is None:
+        price_fcfa = calculer_prix_recharge(nombre)
+    journal = charger_journal_ventes()
+    journal.append(
+        {
+            "type": "recharge",
+            "date": datetime.datetime.now().isoformat(),
+            "client": code_client,
+            "signals": int(nombre),
+            "price": int(price_fcfa),
+            "admin": admin_name,
+        }
+    )
+    sauvegarder_journal_ventes(journal)
+
+def journaliser_abonnement(code_client, admin_name, duree_jours=30, price_fcfa=None):
+    if price_fcfa is None:
+        price_fcfa = ABONNEMENT_PRICE
+    journal = charger_journal_ventes()
+    journal.append(
+        {
+            "type": "abonnement",
+            "date": datetime.datetime.now().isoformat(),
+            "client": code_client,
+            "duration_days": int(duree_jours),
+            "price": int(price_fcfa),
+            "admin": admin_name,
+        }
+    )
+    sauvegarder_journal_ventes(journal)
+
+async def _envoyer_notification_groupe(context: ContextTypes.DEFAULT_TYPE, texte: str):
+    """Envoi protégé vers LOG_GROUP_ID ; ne lève pas d'exception en cas d'échec."""
+    if not LOG_GROUP_ID:
+        return
+    try:
+        await context.bot.send_message(chat_id=LOG_GROUP_ID, text=texte, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        logger.exception("Erreur lors de l'envoi du message au groupe LOG_GROUP_ID.")
+    except Exception:
+        logger.exception("Erreur inattendue lors de l'envoi du message au groupe LOG_GROUP_ID.")
+# --- Fin journal ventes ---
 
 def date_heure_securite():
     return datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -1484,6 +1572,30 @@ async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, l
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
+    # --- Journaliser et notifier le groupe de logs (avec montant) ---
+    try:
+        admin_chat = await context.bot.get_chat(admin_chat_id)
+        admin_name = getattr(admin_chat, "full_name", None) or getattr(admin_chat, "username", None) or str(admin_chat_id)
+    except Exception:
+        admin_name = str(admin_chat_id)
+
+    price_fcfa = calculer_prix_recharge(nombre)
+    journaliser_recharge(code_cible, nombre, admin_name, price_fcfa=price_fcfa)
+
+    notif = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💰 <b>NOUVELLE RECHARGE</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Client : {echapper_html_texte(code_cible)}\n\n"
+        f"📦 Pack :\n{int(nombre)} signaux\n\n"
+        f"💵 Montant :\n{format_fcfa(price_fcfa)} FCFA\n\n"
+        f"👨‍💼 Effectuée par :\n{echapper_html_texte(admin_name)}\n\n"
+        f"🕒 Heure :\n{echapper_html_texte(datetime.datetime.now().strftime('%H:%M'))}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    await _envoyer_notification_groupe(context, notif)
+
 
 async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_jour=None):
     data = migrer_si_besoin(charger_users())
@@ -1543,6 +1655,29 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
+    # --- Journaliser et notifier le groupe de logs (avec montant) ---
+    try:
+        admin_chat = await context.bot.get_chat(admin_chat_id)
+        admin_name = getattr(admin_chat, "full_name", None) or getattr(admin_chat, "username", None) or str(admin_chat_id)
+    except Exception:
+        admin_name = str(admin_chat_id)
+
+    price_fcfa = ABONNEMENT_PRICE
+    journaliser_abonnement(code_cible, admin_name, duree_jours=30, price_fcfa=price_fcfa)
+
+    notif = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👑 <b>NOUVEL ABONNEMENT</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Client : {echapper_html_texte(code_cible)}\n\n"
+        "📅 Durée :\n30 jours\n\n"
+        f"💵 Montant :\n{format_fcfa(price_fcfa)} FCFA\n\n"
+        f"🕒 Heure :\n{echapper_html_texte(datetime.datetime.now().strftime('%H:%M'))}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    await _envoyer_notification_groupe(context, notif)
+
 
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1569,7 +1704,7 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid_cible = trouver_uid_par_code(data, code_cible)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"�❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
     user_cible = data[uid_cible]
@@ -1867,6 +2002,7 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=(
+
                 "⚠️ Ton abonnement mensuel VIP a été désactivé.\n\n"
                 f"{statut}\n\n"
                 f"Pour renouveler, contacte l'admin : {admin_username_html()}"
@@ -2067,6 +2203,7 @@ async def addsignal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=(
+
                 "━━━━━━━━━━━━━━━━━━\n"
                 "🎉 <b>Recharge effectuée</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
@@ -2743,6 +2880,79 @@ async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
                 logger.exception("Impossible de notifier l'admin pour l'expiration %s.", code)
 
 
+# --- Rapport quotidien ---
+async def envoyer_rapport_journalier(context: ContextTypes.DEFAULT_TYPE):
+    if not LOG_GROUP_ID:
+        return
+
+    aujourd_hui = datetime.date.today()
+
+    # Nouveaux clients à partir du journal de sécurité
+    nouveaux_clients = 0
+    try:
+        journal_sec = charger_journal_securite()
+        for ev in journal_sec:
+            if ev.get("evenement") == "connexion":
+                try:
+                    dt = datetime.datetime.strptime(ev.get("date", ""), "%d/%m/%Y %H:%M")
+                    if dt.date() == aujourd_hui:
+                        nouveaux_clients += 1
+                except Exception:
+                    continue
+    except Exception:
+        logger.exception("Impossible de lire security_log pour le rapport quotidien.")
+
+    # Ventes aujourd'hui
+    recharges_count = 0
+    abonnements_count = 0
+    total_signaux_recharges = 0
+    chiffre_affaires = 0
+    try:
+        ventes = charger_journal_ventes()
+        for e in ventes:
+            try:
+                dt = datetime.datetime.fromisoformat(e.get("date"))
+                if dt.date() != aujourd_hui:
+                    continue
+            except Exception:
+                continue
+
+            if e.get("type") == "recharge":
+                recharges_count += 1
+                try:
+                    total_signaux_recharges += int(e.get("signals", 0))
+                except Exception:
+                    pass
+                try:
+                    chiffre_affaires += int(e.get("price", 0))
+                except Exception:
+                    pass
+            elif e.get("type") == "abonnement":
+                abonnements_count += 1
+                try:
+                    chiffre_affaires += int(e.get("price", 0))
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("Impossible de lire sales_log pour le rapport quotidien.")
+
+    texte = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📊 <b>RAPPORT DE LA JOURNÉE</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Nouveaux clients : {nouveaux_clients}\n\n"
+        f"💰 Recharges : {recharges_count}\n\n"
+        f"👑 Abonnements : {abonnements_count}\n\n"
+        f"💵 Chiffre d'affaires : {format_fcfa(chiffre_affaires)} FCFA\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📈 Activité générée automatiquement\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    await _envoyer_notification_groupe(context, texte)
+# --- Fin rapport quotidien ---
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -2809,6 +3019,16 @@ def creer_application():
 
     if app.job_queue:
         app.job_queue.run_repeating(verifier_expirations, interval=86400, first=60)
+        # planifier le rapport quotidien à 23:59 (calcule retard initial)
+        def secondes_jusqua(hour, minute):
+            maintenant = datetime.datetime.now()
+            cible = datetime.datetime.combine(maintenant.date(), datetime.time(hour, minute))
+            if cible <= maintenant:
+                cible = cible + datetime.timedelta(days=1)
+            return (cible - maintenant).total_seconds()
+
+        premier_delai = int(secondes_jusqua(23, 59))
+        app.job_queue.run_repeating(envoyer_rapport_journalier, interval=86400, first= premier_delai)
     else:
         logger.warning("Job queue indisponible. Vérifie python-telegram-bot[job-queue] dans requirements.txt.")
 
@@ -2830,5 +3050,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
