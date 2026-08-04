@@ -2882,74 +2882,82 @@ async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Rapport quotidien ---
 async def envoyer_rapport_journalier(context: ContextTypes.DEFAULT_TYPE):
-    if not LOG_GROUP_ID:
-        return
-
-    aujourd_hui = datetime.date.today()
-
-    # Nouveaux clients à partir du journal de sécurité
-    nouveaux_clients = 0
+    """
+    Envoi quotidien du rapport dans LOG_GROUP_ID.
+    Mise en garde : toute exception est capturée et loggée pour éviter d'arrêter le bot.
+    """
     try:
-        journal_sec = charger_journal_securite()
-        for ev in journal_sec:
-            if ev.get("evenement") == "connexion":
+        if not LOG_GROUP_ID:
+            logger.info("LOG_GROUP_ID non configuré — rapport quotidien non envoyé.")
+            return
+
+        aujourd_hui = datetime.date.today()
+
+        # Nouveaux clients à partir du journal de sécurité
+        nouveaux_clients = 0
+        try:
+            journal_sec = charger_journal_securite()
+            for ev in journal_sec:
+                if ev.get("evenement") == "connexion":
+                    try:
+                        dt = datetime.datetime.strptime(ev.get("date", ""), "%d/%m/%Y %H:%M")
+                        if dt.date() == aujourd_hui:
+                            nouveaux_clients += 1
+                    except Exception:
+                        continue
+        except Exception:
+            logger.exception("Impossible de lire security_log pour le rapport quotidien.")
+
+        # Ventes aujourd'hui
+        recharges_count = 0
+        abonnements_count = 0
+        total_signaux_recharges = 0
+        chiffre_affaires = 0
+        try:
+            ventes = charger_journal_ventes()
+            for e in ventes:
                 try:
-                    dt = datetime.datetime.strptime(ev.get("date", ""), "%d/%m/%Y %H:%M")
-                    if dt.date() == aujourd_hui:
-                        nouveaux_clients += 1
+                    dt = datetime.datetime.fromisoformat(e.get("date"))
+                    if dt.date() != aujourd_hui:
+                        continue
                 except Exception:
                     continue
+
+                if e.get("type") == "recharge":
+                    recharges_count += 1
+                    try:
+                        total_signaux_recharges += int(e.get("signals", 0))
+                    except Exception:
+                        pass
+                    try:
+                        chiffre_affaires += int(e.get("price", 0))
+                    except Exception:
+                        pass
+                elif e.get("type") == "abonnement":
+                    abonnements_count += 1
+                    try:
+                        chiffre_affaires += int(e.get("price", 0))
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("Impossible de lire sales_log pour le rapport quotidien.")
+
+        texte = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📊 <b>RAPPORT DE LA JOURNÉE</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Nouveaux clients : {nouveaux_clients}\n\n"
+            f"💰 Recharges : {recharges_count}\n\n"
+            f"👑 Abonnements : {abonnements_count}\n\n"
+            f"💵 Chiffre d'affaires : {format_fcfa(chiffre_affaires)} FCFA\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📈 Activité générée automatiquement\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        await _envoyer_notification_groupe(context, texte)
     except Exception:
-        logger.exception("Impossible de lire security_log pour le rapport quotidien.")
-
-    # Ventes aujourd'hui
-    recharges_count = 0
-    abonnements_count = 0
-    total_signaux_recharges = 0
-    chiffre_affaires = 0
-    try:
-        ventes = charger_journal_ventes()
-        for e in ventes:
-            try:
-                dt = datetime.datetime.fromisoformat(e.get("date"))
-                if dt.date() != aujourd_hui:
-                    continue
-            except Exception:
-                continue
-
-            if e.get("type") == "recharge":
-                recharges_count += 1
-                try:
-                    total_signaux_recharges += int(e.get("signals", 0))
-                except Exception:
-                    pass
-                try:
-                    chiffre_affaires += int(e.get("price", 0))
-                except Exception:
-                    pass
-            elif e.get("type") == "abonnement":
-                abonnements_count += 1
-                try:
-                    chiffre_affaires += int(e.get("price", 0))
-                except Exception:
-                    pass
-    except Exception:
-        logger.exception("Impossible de lire sales_log pour le rapport quotidien.")
-
-    texte = (
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📊 <b>RAPPORT DE LA JOURNÉE</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👥 Nouveaux clients : {nouveaux_clients}\n\n"
-        f"💰 Recharges : {recharges_count}\n\n"
-        f"👑 Abonnements : {abonnements_count}\n\n"
-        f"💵 Chiffre d'affaires : {format_fcfa(chiffre_affaires)} FCFA\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📈 Activité générée automatiquement\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    await _envoyer_notification_groupe(context, texte)
+        logger.exception("Erreur lors de l'envoi du rapport quotidien.")
 # --- Fin rapport quotidien ---
 
 
@@ -3018,17 +3026,17 @@ def creer_application():
     app.add_error_handler(error_handler)
 
     if app.job_queue:
+        # Vérifier les expirations une fois par jour
         app.job_queue.run_repeating(verifier_expirations, interval=86400, first=60)
-        # planifier le rapport quotidien à 23:59 (calcule retard initial)
-        def secondes_jusqua(hour, minute):
-            maintenant = datetime.datetime.now()
-            cible = datetime.datetime.combine(maintenant.date(), datetime.time(hour, minute))
-            if cible <= maintenant:
-                cible = cible + datetime.timedelta(days=1)
-            return (cible - maintenant).total_seconds()
 
-        premier_delai = int(secondes_jusqua(23, 59))
-        app.job_queue.run_repeating(envoyer_rapport_journalier, interval=86400, first= premier_delai)
+        # Planifier l'envoi quotidien du rapport à 23:59 UTC (Côte d'Ivoire = UTC+0)
+        try:
+            report_time = datetime.time(23, 59, tzinfo=datetime.timezone.utc)
+            # run_daily enregistre la tâche tous les jours à l'heure fournie (avec timezone)
+            app.job_queue.run_daily(envoyer_rapport_journalier, time=report_time, name="daily_report")
+            logger.info("Job quotidien d'envoi du rapport enregistré pour 23:59 UTC.")
+        except Exception:
+            logger.exception("Impossible d'enregistrer le job quotidien pour le rapport.")
     else:
         logger.warning("Job queue indisponible. Vérifie python-telegram-bot[job-queue] dans requirements.txt.")
 
