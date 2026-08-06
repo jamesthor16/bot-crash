@@ -1718,9 +1718,23 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
 async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Génère automatiquement un client (code + enregistrement DB) et renvoie le lien d'invitation.
-    Si PostgreSQL indisponible, refuse la création et loggue l'erreur (ne crée rien).
+    Protection admin faite en interne (pas de @handler_securise) pour éviter que controler_acces_client
+    n'intercepte la commande avant la vérification et pour produire des logs de diagnostic.
     """
+    # Vérifier l'administrateur explicitement
     if not est_admin(update):
+        # Log détaillé pour debug
+        try:
+            uid = getattr(update.effective_user, "id", None)
+            username = (getattr(update.effective_user, "username", "") or "").lstrip("@")
+            admin_id_env = os.environ.get("ADMIN_ID")
+            admin_id_saved = get_admin_id()
+            logger.warning(
+                "Tentative /createclient refusée. caller uid=%s username=%s ADMIN_ID_env=%s admin_id_saved=%s",
+                uid, username, admin_id_env, admin_id_saved,
+            )
+        except Exception:
+            logger.exception("Impossible d'observer les métadonnées de l'appelant pour /createclient.")
         await refuser_non_admin(update)
         return
 
@@ -1735,6 +1749,7 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Charger et migrer les users (s'assurer qu'il n'y a pas de doublon)
     data = migrer_si_besoin(charger_users())
+
     # Générer code unique
     code = generer_code_unique(data)
     maintenant = datetime.datetime.now().isoformat()
@@ -1789,10 +1804,8 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
+    logger.info("Nouveau client créé: code=%s par uid=%s", code, getattr(update.effective_user, "id", None))
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
-
-# --- FIN createclient ---
-
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
