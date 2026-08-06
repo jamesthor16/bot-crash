@@ -1287,7 +1287,49 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Erreur Telegram non interceptée.", exc_info=context.error)
 
 def est_admin(update: Update):
-    username = update.effective_user.username if update.effective_user else None
+    """
+    Retourne True si l'utilisateur est l'administrateur.
+    1) Vérifie ADMIN_ID (variable d'environnement) si définie.
+    2) Vérifie l'ID enregistré via sauvegarder_admin_id (fichier/DB).
+    3) Fallback : compare le username avec ADMIN_USERNAME (variable d'env).
+    """
+    if not update.effective_user:
+        return False
+
+    # ID Telegram de l'utilisateur courant
+    try:
+        uid = int(update.effective_user.id)
+    except Exception:
+        uid = None
+
+    # Username sans @
+    username = (update.effective_user.username or "").lstrip("@")
+
+    # 1) ADMIN_ID depuis la variable d'environnement (optionnel)
+    admin_id_env = os.environ.get("ADMIN_ID")
+    if admin_id_env:
+        try:
+            if uid is not None and int(admin_id_env) == uid:
+                return True
+        except Exception:
+            # ignore invalid env value
+            pass
+
+    # 2) ID administrateur sauvegardé (via /admin qui appelle sauvegarder_admin_id)
+    try:
+        admin_id_saved = get_admin_id()
+        if admin_id_saved:
+            try:
+                if uid is not None and int(admin_id_saved) == uid:
+                    return True
+            except Exception:
+                # ignore conversion problems
+                pass
+    except Exception:
+        # Si lecture admin_id échoue, on continue vers le fallback
+        logger.exception("Impossible de lire l'admin_id pendant la vérification admin.")
+
+    # 3) Fallback : comparaison du username
     return username == ADMIN_USERNAME
 
 async def refuser_non_admin(update: Update):
