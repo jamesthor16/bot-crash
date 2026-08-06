@@ -3005,8 +3005,10 @@ async def supprimer_webhook(application: Application):
     logger.info("Webhook supprimé. Démarrage du polling.")
 
 def creer_application():
-    if not TOKEN:
-        raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
+     if not TOKEN:
+-        raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
++    if not TOKEN:
++        raise RuntimeError("La variable d'environnement BOT_TOKEN ou TOKEN est obligatoire.")
     
     app = ApplicationBuilder().token(TOKEN).post_init(supprimer_webhook).build()
     app.add_handler(CommandHandler("start", start))
