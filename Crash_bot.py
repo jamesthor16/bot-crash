@@ -1675,24 +1675,27 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
 @handler_securise
 async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Génère automatiquement un client (code + enregistrement DB) et renvoie le lien d'invitation.
-    Si PostgreSQL indisponible, refuse la création et loggue l'erreur (ne crée rien).
+    Génère automatiquement un client (code + enregistrement) et renvoie le lien d'invitation.
+    Si PostgreSQL est indisponible on utilise le stockage JSON local (users.json) comme fallback
+    — on ne bloque plus la création. On logge toujours l'état pour diagnostics.
     """
     if not est_admin(update):
         await refuser_non_admin(update)
         return
 
-    # Vérifier que la DB est disponible
-    if not initialiser_base_de_donnees():
-        logger.error("Tentative de création de client alors que PostgreSQL est indisponible.")
-        await update.message.reply_text(
-            "❌ Impossible de créer un client : base de données indisponible.\n\nAucune donnée n'a été modifiée.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    # Tenter d'initialiser la DB uniquement pour information (ne bloque pas la création)
+    db_ok = False
+    try:
+        db_ok = initialiser_base_de_donnees()
+    except Exception:
+        logger.exception("Erreur pendant initialiser_base_de_donnees() (création client). Continuer en fallback JSON.")
 
-    # Charger et migrer les users (s'assurer qu'il n'y a pas de doublon)
+    if not db_ok:
+        logger.warning("PostgreSQL indisponible — création du client dans le stockage local (JSON).")
+
+    # Charger et migrer les users (migrer_si_besoin marche sur le backend disponible : Postgres ou JSON)
     data = migrer_si_besoin(charger_users())
+
     # Générer code unique
     code = generer_code_unique(data)
     maintenant = datetime.datetime.now().isoformat()
@@ -1718,7 +1721,7 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sauvegarder_users(data)
     except Exception as exc:
-        logger.exception("Erreur lors de l'enregistrement du nouveau client.", exc_info=exc)
+        logger.exception("Erreur lors de l'enregistrement du nouveau client (createclient).", exc_info=exc)
         await update.message.reply_text(
             "❌ Erreur lors de l'enregistrement du client. Vérifiez les logs.",
             parse_mode=ParseMode.HTML,
@@ -1744,12 +1747,12 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🔗 Lien d'invitation\n\n"
         f"{lien}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Stockage : {'PostgreSQL' if db_ok else 'JSON local (fallback)'}"
     )
 
+    logger.info("Nouveau client créé: code=%s by uid=%s storage=%s", code, getattr(update.effective_user, "id", None), 'postgres' if db_ok else 'json')
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
-
-# --- FIN createclient ---
 
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
