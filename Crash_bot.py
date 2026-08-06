@@ -46,32 +46,25 @@ LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))  # mettre -100... dans l
 SALES_LOG_KEY = "sales_log"
 
 # Configuration des prix (modifiable)
-# Packs affichés dans le menu :
-# 100 -> 2000 FCFA, 250 -> 4000 FCFA, 500 -> 7000 FCFA, abonnement mensuel -> 12000 FCFA
 PACK_PRICES = {
     100: 2000,
     250: 4000,
     500: 7000,
 }
-DEFAULT_PRICE_PER_SIGNAL = 20  # si le nombre n'est pas un pack connu, prix par signal par défaut (FCFA)
-ABONNEMENT_PRICE = 12000  # prix fixe pour abonnement mensuel (FCFA)
-
+DEFAULT_PRICE_PER_SIGNAL = 20
+ABONNEMENT_PRICE = 12000
 
 def admin_username_html():
     return f"@{html.escape(ADMIN_USERNAME)}"
 
-
 def echapper_html_texte(texte):
-    """Échappe les caractères HTML spéciaux pour une utilisation sûre en ParseMode.HTML"""
     return html.escape(str(texte), quote=True)
-
 
 def format_fcfa(n):
     try:
         return f"{int(n):,}".replace(",", " ")
     except Exception:
         return str(n)
-
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -90,7 +83,6 @@ analyses_en_cours = set()
 signal_history_lock = threading.Lock()
 derniers_signaux_generes = []
 
-
 def copie_defaut(default):
     if isinstance(default, dict):
         return default.copy()
@@ -98,14 +90,12 @@ def copie_defaut(default):
         return list(default)
     return default
 
-
 def chemins_migration_json(*noms):
     chemins = []
     for nom in noms:
         if nom and nom not in chemins:
             chemins.append(nom)
     return chemins
-
 
 def lire_json_migration(path, default):
     if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -116,7 +106,6 @@ def lire_json_migration(path, default):
     except (JSONDecodeError, OSError) as exc:
         logger.exception("Impossible d'importer %s vers PostgreSQL.", path, exc_info=exc)
         return copie_defaut(default)
-
 
 def lire_json_fichier(path, default):
     with storage_lock:
@@ -137,7 +126,6 @@ def lire_json_fichier(path, default):
             storage_cache[path] = valeur
             return valeur
 
-
 def ecrire_json_fichier(path, data):
     dossier = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(dossier, exist_ok=True)
@@ -150,13 +138,11 @@ def ecrire_json_fichier(path, data):
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
 
-
 def avertir_stockage_json(message):
     global db_warning_logged
     if not db_warning_logged:
         logger.warning("%s Utilisation du stockage JSON.", message)
         db_warning_logged = True
-
 
 def get_db_pool():
     global db_pool, db_disabled, Jsonb
@@ -179,8 +165,13 @@ def get_db_pool():
             return None
     return db_pool
 
-
 def initialiser_base_de_donnees():
+    """
+    Initialise la base et effectue une migration minimale :
+    - crée les tables si besoin
+    - migre le JSON vers Postgres si tables vides
+    - génère des codes pour les utilisateurs existants qui n'en ont pas (SEULEMENT si Postgres disponible)
+    """
     global db_initialized, db_disabled
     if db_initialized:
         return not db_disabled
@@ -231,6 +222,22 @@ def initialiser_base_de_donnees():
                 conn.commit()
 
             migrer_json_vers_postgres_si_vide()
+
+            # Après avoir un pool valide et les utilisateurs chargés, s'assurer que chaque user a un 'code'
+            # et que la colonne code_client est synchronisée => utilité pour la nouvelle logique d'invitations.
+            try:
+                data = lire_json(DATA_FILE, {})
+                modifie = False
+                for uid, user in data.items():
+                    if not isinstance(user, dict):
+                        continue
+                    if "code" not in user or not user.get("code"):
+                        user["code"] = generer_code_unique(data)
+                        modifie = True
+                if modifie:
+                    sauvegarder_users(data)
+            except Exception:
+                logger.exception("Impossible d'assigner automatiquement des codes aux comptes existants.")
         except Exception as exc:
             logger.warning("Connexion PostgreSQL impossible (%s). Utilisation du stockage JSON.", exc)
             db_disabled = True
@@ -238,7 +245,6 @@ def initialiser_base_de_donnees():
             return False
         db_initialized = True
         return True
-
 
 def migrer_json_vers_postgres_si_vide():
     pool = get_db_pool()
@@ -300,14 +306,12 @@ def migrer_json_vers_postgres_si_vide():
                     )
         conn.commit()
 
-
 def valeur_texte(data, *cles):
     for cle in cles:
         valeur = data.get(cle)
         if valeur is not None:
             return str(valeur)
     return None
-
 
 def valeur_entier(data, *cles):
     for cle in cles:
@@ -318,7 +322,6 @@ def valeur_entier(data, *cles):
             except (TypeError, ValueError):
                 return None
     return None
-
 
 def sauvegarder_users_postgres(cur, data, supprimer_absents=True):
     cles = []
@@ -353,7 +356,6 @@ def sauvegarder_users_postgres(cur, data, supprimer_absents=True):
         else:
             cur.execute("DELETE FROM users")
 
-
 def lire_json(path, default):
     if not initialiser_base_de_donnees():
         return lire_json_fichier(path, default)
@@ -386,7 +388,6 @@ def lire_json(path, default):
 
         storage_cache[path] = valeur
         return valeur
-
 
 def ecrire_json(path, data):
     if not initialiser_base_de_donnees():
@@ -440,23 +441,18 @@ def ecrire_json(path, data):
 def get_admin_id():
     return lire_json(ADMIN_ID_FILE, {}).get("id")
 
-
 def sauvegarder_admin_id(user_id):
     ecrire_json(ADMIN_ID_FILE, {"id": user_id})
-
 
 def charger_users():
     return lire_json(DATA_FILE, {})
 
-
 def sauvegarder_users(data):
     ecrire_json(DATA_FILE, data)
-
 
 def charger_journal_securite():
     journal = lire_json(SECURITY_LOG_FILE, [])
     return journal if isinstance(journal, list) else []
-
 
 def sauvegarder_journal_securite(journal):
     ecrire_json(SECURITY_LOG_FILE, journal[-1000:])
@@ -467,15 +463,9 @@ def charger_journal_ventes():
     return journal if isinstance(journal, list) else []
 
 def sauvegarder_journal_ventes(journal):
-    # garder les dernières entrées pour éviter saturation
     ecrire_json(SALES_LOG_KEY, journal[-10000:])
 
 def calculer_prix_recharge(nombre):
-    """
-    Calcule le prix (FCFA) pour une recharge de `nombre` signaux.
-    - si `nombre` correspond exactement à un pack connu (100/250/500), on utilise PACK_PRICES
-    - sinon on utilise DEFAULT_PRICE_PER_SIGNAL * nombre
-    """
     try:
         n = int(nombre)
     except Exception:
@@ -517,7 +507,6 @@ def journaliser_abonnement(code_client, admin_name, duree_jours=30, price_fcfa=N
     sauvegarder_journal_ventes(journal)
 
 async def _envoyer_notification_groupe(context: ContextTypes.DEFAULT_TYPE, texte: str):
-    """Envoi protégé vers LOG_GROUP_ID ; ne lève pas d'exception en cas d'échec."""
     if not LOG_GROUP_ID:
         return
     try:
@@ -530,7 +519,6 @@ async def _envoyer_notification_groupe(context: ContextTypes.DEFAULT_TYPE, texte
 
 def date_heure_securite():
     return datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
-
 
 def journaliser_securite(evenement, code, telegram_id, ancien_telegram_id=None):
     journal = charger_journal_securite()
@@ -545,14 +533,12 @@ def journaliser_securite(evenement, code, telegram_id, ancien_telegram_id=None):
     )
     sauvegarder_journal_securite(journal)
 
-
 def telegram_id_enregistre(user):
     valeur = user.get("telegram_id")
     try:
         return int(valeur) if valeur is not None else None
     except (TypeError, ValueError):
         return None
-
 
 def entier_positif(valeur, defaut=0, maximum=None):
     try:
@@ -565,13 +551,11 @@ def entier_positif(valeur, defaut=0, maximum=None):
         nombre = min(nombre, maximum)
     return nombre
 
-
 def timestamp_ou_none(valeur):
     try:
         return float(valeur)
     except (TypeError, ValueError):
         return None
-
 
 def abonnement_actif(user, maintenant=None):
     if not user.get("vip"):
@@ -584,7 +568,6 @@ def abonnement_actif(user, maintenant=None):
     maintenant = maintenant or datetime.datetime.now()
     return fin_ts > maintenant.timestamp()
 
-
 def abonnement_expire(user, maintenant=None):
     if not user.get("vip") or not user.get("vip_fin"):
         return False
@@ -595,7 +578,6 @@ def abonnement_expire(user, maintenant=None):
 
     maintenant = maintenant or datetime.datetime.now()
     return fin_ts <= maintenant.timestamp()
-
 
 def normaliser_signaux_gratuits(user):
     restants_actuels = entier_positif(user.get("restants", 0), maximum=SIGNAUX_DEFAUT)
@@ -614,15 +596,12 @@ def normaliser_signaux_gratuits(user):
     user["gratuits_deja_donnes"] = True
     return user["signaux_gratuits_restants"]
 
-
 def normaliser_signaux_vip(user):
     user["vip_signals"] = entier_positif(user.get("vip_signals", 0))
     return user["vip_signals"]
 
-
 def date_limite_journaliere():
     return datetime.datetime.now().strftime("%Y-%m-%d")
-
 
 def normaliser_limite_journaliere(user):
     limite = entier_positif(user.get("daily_limit_max", 0))
@@ -645,7 +624,6 @@ def normaliser_limite_journaliere(user):
     user["daily_used"] = entier_positif(user.get("daily_used", 0), maximum=limite)
     return user["daily_used"], limite, True
 
-
 def configurer_limite_journaliere(user, limite=None):
     if limite and limite > 0:
         user["daily_limit_enabled"] = True
@@ -658,18 +636,15 @@ def configurer_limite_journaliere(user, limite=None):
         user["daily_used"] = 0
         user["daily_limit_date"] = date_limite_journaliere()
 
-
 def supprimer_limite_journaliere(user):
     user.pop("daily_limit_enabled", None)
     user.pop("daily_limit_max", None)
     user.pop("daily_used", None)
     user.pop("daily_limit_date", None)
 
-
 def limite_journaliere_atteinte(user):
     utilises, limite, active = normaliser_limite_journaliere(user)
     return active and utilises >= limite
-
 
 def texte_limite_journaliere(user):
     utilises, limite, active = normaliser_limite_journaliere(user)
@@ -677,13 +652,11 @@ def texte_limite_journaliere(user):
         return "📅 Limite quotidienne\nNon activée"
     return f"📅 Limite quotidienne\n<b>{utilises} / {limite}</b> utilisés aujourd'hui"
 
-
 def texte_limite_atteinte():
     return (
         "⛔ <b>Vous avez atteint votre limite quotidienne.</b>\n\n"
         "Revenez demain pour obtenir de nouveaux signaux."
     )
-
 
 def normaliser_signaux_restants(user):
     gratuits = normaliser_signaux_gratuits(user)
@@ -704,7 +677,6 @@ def normaliser_signaux_restants(user):
 
     return user["restants"]
 
-
 def remettre_en_mode_gratuit(user):
     gratuits = normaliser_signaux_gratuits(user)
     user["vip"] = False
@@ -716,14 +688,12 @@ def remettre_en_mode_gratuit(user):
     user.pop("vip_fin", None)
     return gratuits
 
-
 def appliquer_expiration_si_necessaire(user, maintenant=None):
     if not abonnement_expire(user, maintenant=maintenant):
         return False
 
     remettre_en_mode_gratuit(user)
     return True
-
 
 def migrer_si_besoin(data):
     modifie = False
@@ -770,7 +740,6 @@ def migrer_si_besoin(data):
 
     return data
 
-
 def peut_obtenir_signal(user):
     if limite_journaliere_atteinte(user):
         return False
@@ -778,14 +747,13 @@ def peut_obtenir_signal(user):
         return True
     return normaliser_signaux_restants(user) > 0
 
-
 def generer_code_unique(data):
+    # s'assure d'unicité dans 'data'
     codes_existants = {user.get("code") for user in data.values() if isinstance(user, dict)}
     while True:
         code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if code not in codes_existants:
             return code
-
 
 def trouver_uid_par_code(data, code_cible):
     return next(
@@ -797,45 +765,67 @@ def trouver_uid_par_code(data, code_cible):
         None,
     )
 
-
+# NOTE: Changement principal ici : associer_ou_creer_user ne crée PLUS d'utilisateur "libre" sans code.
+# Il ne permet que :
+# - l'association d'un code existant à un Telegram ID (première connexion),
+# - ou retourne des statuts indiquant 'no_account'/'invalid_code'/'device_locked'/'ok'/'banned'.
 def associer_ou_creer_user(user_id, code_cible=None):
     data = migrer_si_besoin(charger_users())
     uid = str(user_id)
     code_cible = code_cible.upper() if code_cible else None
 
+    # Si un code est fourni : tenter d'associer
     if code_cible:
         uid_code = trouver_uid_par_code(data, code_cible)
-        if uid_code is not None and uid_code != uid:
-            user_code = data[uid_code]
-            ancien_telegram_id = telegram_id_enregistre(user_code)
+        # Si le code n'existe pas : invalide
+        if uid_code is None:
+            return data, uid, "invalid_code", None
+
+        # Si le code correspond déjà au même user numeric (rare), ok
+        if uid_code == uid:
+            user = data[uid]
+            ancien_telegram_id = telegram_id_enregistre(user)
             if ancien_telegram_id and ancien_telegram_id != user_id:
                 journaliser_securite("tentative_connexion", code_cible, user_id, ancien_telegram_id)
-                return data, uid_code, "device_locked", ancien_telegram_id
-
-            user_code["telegram_id"] = user_id
-            data[uid] = user_code
-            del data[uid_code]
-            sauvegarder_users(data)
-            journaliser_securite("connexion", user_code.get("code", code_cible), user_id)
+                return data, uid, "device_locked", ancien_telegram_id
+            if user.get("banned", False):
+                return data, uid, "banned", None
+            # ensure telegram_id set
+            if user.get("telegram_id") is None:
+                user["telegram_id"] = user_id
+                user["first_connection"] = user.get("first_connection") or datetime.datetime.now().isoformat()
+                user["invitation_used"] = True
+                sauvegarder_users(data)
+                journaliser_securite("connexion", user.get("code", code_cible), user_id)
             return data, uid, "ok", None
 
-    if uid not in data:
-        data[uid] = {
-            "restants": SIGNAUX_DEFAUT,
-            "vip": False,
-            "code": generer_code_unique(data),
-            "telegram_id": user_id,
-            "banned": False,
-            "gratuits_deja_donnes": True,
-            "signaux_gratuits_restants": SIGNAUX_DEFAUT,
-            "vip_signals": 0,
-            "illimite": False,
-            "historique_signaux": [],
-        }
+        # Si code trouvé sous une autre clé (typiquement la clé est le code)
+        user_code = data[uid_code]
+        ancien_telegram_id = telegram_id_enregistre(user_code)
+        if ancien_telegram_id and ancien_telegram_id != user_id:
+            journaliser_securite("tentative_connexion", code_cible, user_id, ancien_telegram_id)
+            return data, uid_code, "device_locked", ancien_telegram_id
+
+        # Associer désormais le compte au nouvel uid (string of telegram id)
+        user_code["telegram_id"] = user_id
+        user_code["first_connection"] = user_code.get("first_connection") or datetime.datetime.now().isoformat()
+        user_code["invitation_used"] = True
+        # Déplacer sous la clé uid numérique
+        data[uid] = user_code
+        try:
+            del data[uid_code]
+        except KeyError:
+            pass
         sauvegarder_users(data)
-        journaliser_securite("connexion", data[uid].get("code"), user_id)
+        journaliser_securite("connexion", user_code.get("code", code_cible), user_id)
         return data, uid, "ok", None
 
+    # Si aucun code fourni : ne PAS créer d'utilisateur.
+    # On vérifie uniquement si le uid existe déjà (compte déjà associé)
+    if uid not in data:
+        return data, uid, "no_account", None
+
+    # uid existe :
     user = data[uid]
     ancien_telegram_id = telegram_id_enregistre(user)
     if ancien_telegram_id and ancien_telegram_id != user_id:
@@ -851,12 +841,12 @@ def associer_ou_creer_user(user_id, code_cible=None):
 
     return data, uid, "ok", None
 
-
+# Après changement : get_ou_creer_user devient simple récupérateur. Les validations d'accès se font
+# dans controler_acces_client (via associer_ou_creer_user)
 def get_ou_creer_user(user_id, code_cible=None):
-    data, uid, statut, _ = associer_ou_creer_user(user_id, code_cible=code_cible)
-
+    data = migrer_si_besoin(charger_users())
+    uid = str(user_id)
     return data, uid
-
 
 def sauvegarder_message_id(user_id, message_id):
     data = charger_users()
@@ -864,7 +854,6 @@ def sauvegarder_message_id(user_id, message_id):
     if uid in data:
         data[uid].setdefault("messages", []).append(message_id)
         sauvegarder_users(data)
-
 
 def consommer_signal(user_id, signal_txt=None):
     data = charger_users()
@@ -916,7 +905,6 @@ def consommer_signal(user_id, signal_txt=None):
     sauvegarder_users(data)
     return {"restants": restants_apres, "mode": mode, "illimite": False}
 
-
 def get_secondes_restantes(user):
     dernier = timestamp_ou_none(user.get("dernier_signal"))
     if not dernier:
@@ -924,11 +912,9 @@ def get_secondes_restantes(user):
     ecoule = datetime.datetime.now().timestamp() - dernier
     return max(0, int(COOLDOWN_SECONDS - ecoule))
 
-
 def formater_date(ts):
     ts = timestamp_ou_none(ts) or datetime.datetime.now().timestamp()
     return datetime.datetime.fromtimestamp(ts).strftime("%d/%m/%Y")
-
 
 def jours_restants_jusqua(ts, maintenant=None):
     ts = timestamp_ou_none(ts)
@@ -937,10 +923,8 @@ def jours_restants_jusqua(ts, maintenant=None):
     maintenant = maintenant or datetime.datetime.now()
     return max(0, (datetime.datetime.fromtimestamp(ts) - maintenant).days)
 
-
 def formater_heure_signal(dt):
     return dt.strftime("%H:%M")
-
 
 def niveau_depuis_coefficient(coefficient):
     if coefficient >= 9:
@@ -948,7 +932,6 @@ def niveau_depuis_coefficient(coefficient):
     if coefficient >= 8:
         return "Élevé"
     return "Premium"
-
 
 def texte_compteur_compte(user):
     limite = texte_limite_journaliere(user)
@@ -987,7 +970,6 @@ def texte_compteur_compte(user):
         "💎 Contactez l'administrateur pour recharger votre compte."
     )
 
-
 def texte_expiration(user):
     if normaliser_signaux_gratuits(user) <= 0:
         return (
@@ -1001,7 +983,6 @@ def texte_expiration(user):
         f"⚡ Il vous reste <b>{normaliser_signaux_gratuits(user)}</b> signaux gratuits."
     )
 
-
 def ajouter_historique_signal(user, signal_txt, statut):
     historique = user.setdefault("historique_signaux", [])
     historique.append(
@@ -1013,12 +994,10 @@ def ajouter_historique_signal(user, signal_txt, statut):
     )
     user["historique_signaux"] = historique[-HISTORIQUE_LIMIT:]
 
-
 def memoriser_signal_interne(coefficient):
     with signal_history_lock:
         derniers_signaux_generes.append(float(coefficient))
         del derniers_signaux_generes[:-SIGNAL_MEMORY_LIMIT]
-
 
 def derniers_multiplicateurs(user, limite=SIGNAL_MEMORY_LIMIT):
     valeurs = []
@@ -1033,7 +1012,6 @@ def derniers_multiplicateurs(user, limite=SIGNAL_MEMORY_LIMIT):
     with signal_history_lock:
         valeurs.extend(derniers_signaux_generes[-limite:])
     return valeurs
-
 
 def opportunite_marche_disponible(user):
     historique = user.get("historique_signaux", [])
@@ -1056,11 +1034,9 @@ def opportunite_marche_disponible(user):
 
     return random.random() >= min(refus_probability, 0.10)
 
-
 def barre_progression(pourcentage):
     blocs = max(0, min(10, round(pourcentage / 10)))
     return f"{'\u2588' * blocs}{'\u2591' * (10 - blocs)} {pourcentage}%"
-
 
 def texte_analyse(etape, pourcentage, titres=None):
     titres = titres or [
@@ -1124,7 +1100,6 @@ async def lancer_animation_analyse(query, user_id):
 
     return message
 
-
 def delai_signal_depuis_coefficient(coefficient):
     if coefficient >= 3.10:
         return 4
@@ -1133,7 +1108,6 @@ def delai_signal_depuis_coefficient(coefficient):
     if coefficient >= 2.25:
         return 6
     return 7
-
 
 def generer_multiplicateur_pondere():
     plage = random.choices(
@@ -1148,10 +1122,8 @@ def generer_multiplicateur_pondere():
     )[0]
     return round(random.uniform(*plage), 2)
 
-
 def multiplicateur_trop_proche(coefficient, deja_vus):
     return any(abs(float(coefficient) - float(valeur)) < 0.06 for valeur in deja_vus[-6:])
-
 
 def generer_assurance_intelligente(coefficient):
     ratio = (coefficient - 2.00) / 1.50
@@ -1160,7 +1132,6 @@ def generer_assurance_intelligente(coefficient):
     assurance = max(1.50, min(2.50, assurance))
     assurance = min(assurance, coefficient - 0.22)
     return round(max(1.50, min(2.50, assurance)), 2)
-
 
 def generer_signal(user=None):
     heure_date = datetime.datetime.now()
@@ -1193,7 +1164,6 @@ def generer_signal(user=None):
     )
     return message, True
 
-
 def texte_restant_apres_signal(user, etat):
     if etat.get("illimite"):
         ligne = "👑 Il vous reste ♾️ signaux VIP."
@@ -1212,7 +1182,6 @@ def texte_restant_apres_signal(user, etat):
 # ===== MENUS RESTRUCTURÉS =====
 
 def bouton_signal(restants=None, vip=False, illimite=False):
-    """Menu principal - 3 boutons seulement (compact et professionnel)"""
     if illimite:
         label = "\U0001f4a5 Obtenir un signal (\u221e)"
     elif restants is not None:
@@ -1228,9 +1197,7 @@ def bouton_signal(restants=None, vip=False, illimite=False):
         ]
     )
 
-
 def bouton_compte():
-    """Sous-menu : Mon compte (3 options + retour)"""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("\U0001f4ca Mes signaux", callback_data="historique")],
@@ -1240,9 +1207,7 @@ def bouton_compte():
         ]
     )
 
-
 def bouton_vip_menu():
-    """Sous-menu : VIP & Support (2 options + retour)"""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("\U0001f6d2 Acheter un pack", callback_data="vip")],
@@ -1252,7 +1217,6 @@ def bouton_vip_menu():
     )
 
 def bouton_vip():
-    """Fallback : Quand l'utilisateur n'a pas de signaux"""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("💎 Acheter un pack", callback_data="vip")],
@@ -1262,9 +1226,7 @@ def bouton_vip():
         ]
     )
 
-
 def bouton_vip_pack():
-    """Menu des packs VIP avec retour vers VIP & Support."""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📞 Support", callback_data="support")],
@@ -1272,14 +1234,9 @@ def bouton_vip_pack():
         ]
     )
 
-
 # ===== FONCTION POUR REMPLACER LES MESSAGES =====
 
 async def remplacer_message(query, texte, markup=None):
-    """
-    Supprime le message actuel et envoie un nouveau message à sa place.
-    Rend le bot très professionnel sans clutter.
-    """
     try:
         await query.message.delete()
     except TelegramError:
@@ -1291,9 +1248,7 @@ async def remplacer_message(query, texte, markup=None):
         parse_mode=ParseMode.HTML,
     )
 
-
 async def modifier_message(query, texte, markup=None):
-    """Modifie le message courant et garde une navigation fluide."""
     try:
         return await query.message.edit_text(
             text=texte,
@@ -1307,7 +1262,6 @@ async def modifier_message(query, texte, markup=None):
             reply_markup=markup,
             parse_mode=ParseMode.HTML,
         )
-
 
 def handler_securise(func):
     @wraps(func)
@@ -1329,20 +1283,16 @@ def handler_securise(func):
 
     return wrapper
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Erreur Telegram non interceptée.", exc_info=context.error)
-
 
 def est_admin(update: Update):
     username = update.effective_user.username if update.effective_user else None
     return username == ADMIN_USERNAME
 
-
 async def refuser_non_admin(update: Update):
     if update.effective_message:
         await update.effective_message.reply_text("❌ Commande réservée à l'administrateur.", parse_mode=ParseMode.HTML)
-
 
 async def envoyer_message_acces(update: Update, texte):
     if update.callback_query:
@@ -1353,7 +1303,6 @@ async def envoyer_message_acces(update: Update, texte):
             await update.callback_query.message.reply_text(texte, parse_mode=ParseMode.HTML)
     elif update.effective_message:
         await update.effective_message.reply_text(texte, parse_mode=ParseMode.HTML)
-
 
 async def notifier_tentative_connexion(context: ContextTypes.DEFAULT_TYPE, code, ancien_telegram_id, nouveau_telegram_id):
     admin_id = get_admin_id()
@@ -1375,8 +1324,15 @@ async def notifier_tentative_connexion(context: ContextTypes.DEFAULT_TYPE, code,
     except TelegramError:
         logger.exception("Impossible de notifier l'administrateur de la tentative de connexion.")
 
-
+# CONTROL D'ACCES PRINCIPAL
 async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    - Si admin => accès.
+    - Si message /start CODE : on tente d'associer le code (uniquement si code existe).
+    - Si utilisateur déjà associé (telegram_id présent) => accès.
+    - Sinon : bloqué et affiche le message d'accès privé.
+    """
+    # Admin bypass
     if not update.effective_user or est_admin(update):
         return True
 
@@ -1387,33 +1343,78 @@ async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_T
             code_start = morceaux[1].upper()
 
     user_id = update.effective_user.id
-    data, uid, statut, ancien_telegram_id = associer_ou_creer_user(user_id, code_cible=code_start)
-    user = data.get(uid, {}) if uid else {}
 
-    if statut == "device_locked":
-        code = user.get("code", code_start or "?")
+    # Si on a un code dans le start => tenter d'associer
+    if code_start:
+        data, uid, statut, ancien = associer_ou_creer_user(user_id, code_cible=code_start)
+        if statut == "invalid_code":
+            # Code inconnu -> refuser accès (invite invalide)
+            await envoyer_message_acces(
+                update,
+                "❌ L'invitation fournie est invalide.\n\nVeuillez contacter l'administrateur.",
+            )
+            return False
+        if statut == "device_locked":
+            code = code_start
+            await envoyer_message_acces(
+                update,
+                "❌ Ce lien d'invitation est déjà utilisé.\n\nVeuillez contacter l'administrateur.",
+            )
+            await notifier_tentative_connexion(context, code, ancien, user_id)
+            return False
+        if statut == "banned":
+            await envoyer_message_acces(
+                update,
+                "🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.",
+            )
+            return False
+        if statut == "ok":
+            return True
+        # tout autre statut => refuser
         await envoyer_message_acces(
             update,
-            "❌ Ce compte est déjà associé à un autre compte Telegram.\n\n"
-            "Si vous avez changé de téléphone ou créé un nouveau compte Telegram, contactez l'administrateur.",
-        )
-        await notifier_tentative_connexion(context, code, ancien_telegram_id, user_id)
-        return False
-
-    if statut == "banned" or user.get("banned", False):
-        await envoyer_message_acces(
-            update,
-            "🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.",
+            "❌ Accès refusé. Veuillez contacter l'administrateur.",
         )
         return False
 
-    return True
+    # Pas de code fourni : vérifier si l'utilisateur est déjà associé
+    data = migrer_si_besoin(charger_users())
+    uid = str(user_id)
+    if uid in data:
+        # utilisateur existant
+        user = data[uid]
+        if user.get("banned", False):
+            await envoyer_message_acces(update, "🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.")
+            return False
+        # OK
+        return True
 
+    # Sinon : accès privé (aucun menu, aucun bouton)
+    private_msg = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🔒 ACCÈS PRIVÉ\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Ce bot est réservé aux clients autorisés.\n\n"
+        "Veuillez contacter l'administrateur afin d'obtenir votre invitation.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await envoyer_message_acces(update, private_msg)
+    return False
 
 @handler_securise
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # à ce stade controler_acces_client a déjà permis l'accès (admin, user existant, ou association par code)
     data, uid = get_ou_creer_user(user_id)
+    # s'il n'existe pas dans data (rare si controler_acces_client a autorisé mais ...)
+    if uid not in data:
+        # sécurité : refuse
+        await update.message.reply_text(
+            "❌ Accès introuvable. Contacter l'administrateur.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     user = data[uid]
     expire = appliquer_expiration_si_necessaire(user)
     normaliser_signaux_restants(user)
@@ -1459,7 +1460,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.HTML)
     sauvegarder_message_id(user_id, msg.message_id)
 
-
 @handler_securise
 async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1490,7 +1490,6 @@ async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         sauvegarder_message_id(user_id, msg.message_id)
 
-
 @handler_securise
 async def mon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1499,7 +1498,6 @@ async def mon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 Ton code client est : <code>{echapper_html_texte(data[uid]['code'])}</code>\n\nDonne ce code à l'admin pour recharger tes signaux.",
         parse_mode=ParseMode.HTML,
     )
-
 
 def bouton_choix_limite_journaliere():
     return InlineKeyboardMarkup(
@@ -1511,7 +1509,6 @@ def bouton_choix_limite_journaliere():
         ]
     )
 
-
 async def demander_limite_journaliere(update, code_cible, operation, nombre=None):
     details = f"\n\nSignaux : <b>{nombre}</b>" if nombre is not None else ""
     await update.message.reply_text(
@@ -1520,7 +1517,6 @@ async def demander_limite_journaliere(update, code_cible, operation, nombre=None
         parse_mode=ParseMode.HTML,
         reply_markup=bouton_choix_limite_journaliere(),
     )
-
 
 async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, limite_jour=None):
     data = migrer_si_besoin(charger_users())
@@ -1572,7 +1568,6 @@ async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, l
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
-    # --- Journaliser et notifier le groupe de logs (avec montant) ---
     try:
         admin_chat = await context.bot.get_chat(admin_chat_id)
         admin_name = getattr(admin_chat, "full_name", None) or getattr(admin_chat, "username", None) or str(admin_chat_id)
@@ -1595,7 +1590,6 @@ async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, l
     )
 
     await _envoyer_notification_groupe(context, notif)
-
 
 async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_jour=None):
     data = migrer_si_besoin(charger_users())
@@ -1655,7 +1649,6 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
-    # --- Journaliser et notifier le groupe de logs (avec montant) ---
     try:
         admin_chat = await context.bot.get_chat(admin_chat_id)
         admin_name = getattr(admin_chat, "full_name", None) or getattr(admin_chat, "username", None) or str(admin_chat_id)
@@ -1678,6 +1671,85 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
 
     await _envoyer_notification_groupe(context, notif)
 
+# --- NOUVELLE COMMANDE ADMIN : /createclient ---
+@handler_securise
+async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Génère automatiquement un client (code + enregistrement DB) et renvoie le lien d'invitation.
+    Si PostgreSQL indisponible, refuse la création et loggue l'erreur (ne crée rien).
+    """
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    # Vérifier que la DB est disponible
+    if not initialiser_base_de_donnees():
+        logger.error("Tentative de création de client alors que PostgreSQL est indisponible.")
+        await update.message.reply_text(
+            "❌ Impossible de créer un client : base de données indisponible.\n\nAucune donnée n'a été modifiée.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Charger et migrer les users (s'assurer qu'il n'y a pas de doublon)
+    data = migrer_si_besoin(charger_users())
+    # Générer code unique
+    code = generer_code_unique(data)
+    maintenant = datetime.datetime.now().isoformat()
+
+    # Créer l'entrée utilisateur associée au code (clé = code). Telegram ID = None
+    data[code] = {
+        "restants": SIGNAUX_DEFAUT,
+        "vip": False,
+        "code": code,
+        "telegram_id": None,
+        "banned": False,
+        "gratuits_deja_donnes": True,
+        "signaux_gratuits_restants": SIGNAUX_DEFAUT,
+        "vip_signals": 0,
+        "illimite": False,
+        "historique_signaux": [],
+        "messages": [],
+        "created_at": maintenant,
+        "first_connection": None,
+        "invitation_used": False,
+    }
+
+    try:
+        sauvegarder_users(data)
+    except Exception as exc:
+        logger.exception("Erreur lors de l'enregistrement du nouveau client.", exc_info=exc)
+        await update.message.reply_text(
+            "❌ Erreur lors de l'enregistrement du client. Vérifiez les logs.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Construction du lien d'invitation en utilisant le nom du bot
+    try:
+        bot_username = context.bot.username
+    except Exception:
+        bot_username = None
+
+    if bot_username:
+        lien = f"https://t.me/{bot_username}?start={code}"
+    else:
+        lien = f"https://t.me/YourBotUsername?start={code}"
+
+    texte = (
+        "✅ Nouveau client créé\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 Code client\n\n"
+        f"{code}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🔗 Lien d'invitation\n\n"
+        f"{lien}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
+
+# --- FIN createclient ---
 
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1743,34 +1815,6 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await demander_limite_journaliere(update, code_cible, "recharge", nombre=nombre)
     return
 
-    user_cible["restants"] = nombre
-    user_cible["vip_signals"] = nombre
-    user_cible["illimite"] = False
-    user_cible.pop("vip_debut", None)
-    user_cible.pop("vip_fin", None)
-    sauvegarder_users(data)
-
-    await update.message.reply_text(
-        f"✅ Client <code>{echapper_html_texte(code_cible)}</code> rechargé avec <b>{nombre}</b> signal{'s' if nombre > 1 else ''} VIP.\n"
-        f"👑 Il lui reste maintenant <b>{nombre}</b> signaux VIP.",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=int(uid_cible),
-            text=(
-                "🎉 Bonne nouvelle !\n\n"
-                "Tes signaux VIP ont été rechargés par l'administrateur.\n"
-                f"👑 Il vous reste <b>{nombre}</b> signaux VIP.\n\n"
-                "Appuie sur /start pour continuer."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        logger.exception("Impossible de notifier le client %s.", uid_cible)
-
-
 @handler_securise
 async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -1811,7 +1855,6 @@ async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lignes.append(ligne)
 
     await update.message.reply_text("\n".join(lignes), parse_mode=ParseMode.HTML)
-
 
 @handler_securise
 async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1860,7 +1903,6 @@ async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
-
 @handler_securise
 async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -1886,45 +1928,6 @@ async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     await demander_limite_journaliere(update, code_cible, "abonnement")
     return
-
-    maintenant = datetime.datetime.now()
-    fin = maintenant + datetime.timedelta(days=30)
-    user_cible = data[uid_cible]
-    normaliser_signaux_gratuits(user_cible)
-    user_cible["vip"] = True
-    user_cible["illimite"] = True
-    user_cible["vip_debut"] = maintenant.timestamp()
-    user_cible["vip_fin"] = fin.timestamp()
-    user_cible["vip_signals"] = 0
-    user_cible["restants"] = None
-    sauvegarder_users(data)
-
-    await update.message.reply_text(
-        f"✅ Abonnement mensuel activé pour <code>{echapper_html_texte(code_cible)}</code> 👑\n\n"
-        "♾️ Signaux illimités activés immédiatement.\n\n"
-        f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
-        f"📆 Fin : <b>{fin.strftime('%d/%m/%Y')}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=int(uid_cible),
-            text=(
-                "🎉 Ton abonnement <b>VIP</b> est activé ! 👑\n\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
-                f"📆 Expire le : <b>{fin.strftime('%d/%m/%Y')}</b>\n"
-                "⏳ Durée : <b>30 jours</b>\n"
-                "♾️ Signaux illimités\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "Tape /start pour voir ton abonnement."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        logger.exception("Impossible de notifier le client %s.", uid_cible)
-
 
 @handler_securise
 async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1965,7 +1968,6 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
-
 
 @handler_securise
 async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2012,7 +2014,6 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
-
 @handler_securise
 async def resetdevice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -2038,7 +2039,6 @@ async def resetdevice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Le prochain utilisateur qui lance <code>/start CODE</code> pourra associer ce compte.",
         parse_mode=ParseMode.HTML,
     )
-
 
 @handler_securise
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2070,7 +2070,6 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         logger.exception("Impossible de notifier le client banni %s.", uid_cible)
 
-
 @handler_securise
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -2092,7 +2091,6 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data[uid_cible]["banned"] = False
     sauvegarder_users(data)
     await update.message.reply_text(f"✅ Client <code>{echapper_html_texte(code_cible)}</code> débanni.", parse_mode=ParseMode.HTML)
-
 
 @handler_securise
 async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2157,7 +2155,6 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 
-
 @handler_securise
 async def addsignal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -2219,7 +2216,6 @@ async def addsignal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         logger.exception("Impossible de notifier le client %s pour l'ajout de signaux.", uid_cible)
 
-
 @handler_securise
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -2256,7 +2252,6 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
-
 @handler_securise
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -2267,7 +2262,6 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["broadcast_waiting"] = True
     await update.message.reply_text("✍️ Envoyez le message à diffuser.", parse_mode=ParseMode.HTML)
 
-
 async def finaliser_action_limite_journaliere(context, chat_id, pending, limite_jour=None):
     operation = pending.get("operation")
     code_cible = pending.get("code")
@@ -2275,7 +2269,6 @@ async def finaliser_action_limite_journaliere(context, chat_id, pending, limite_
         await appliquer_recharge_admin(context, chat_id, code_cible, int(pending.get("nombre", 0)), limite_jour)
     elif operation == "abonnement":
         await appliquer_abonnement_admin(context, chat_id, code_cible, limite_jour)
-
 
 @handler_securise
 async def choix_limite_journaliere_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2302,7 +2295,6 @@ async def choix_limite_journaliere_callback(update: Update, context: ContextType
         "Exemple : <code>5</code>",
         parse_mode=ParseMode.HTML,
     )
-
 
 @handler_securise
 async def limite_journaliere_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2370,7 +2362,6 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
-
 @handler_securise
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -2409,7 +2400,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 
-
 @handler_securise
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -2433,10 +2423,10 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/addsignal CODE NOMBRE</code> — Ajoute des signaux au solde\n"
         "<code>/reset CODE</code> — Réinitialise complètement un client\n"
         "<code>/broadcast</code> — Diffuse un message à tous les utilisateurs\n"
+        "<code>/createclient</code> — Crée automatiquement un client et génère le lien d'invitation\n"
         "<code>/admin</code> — Affiche ce menu",
         parse_mode=ParseMode.HTML,
     )
-
 
 @handler_securise
 async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2511,6 +2501,21 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
+        if not opportunite_marche_disponible(user):
+            msg = await remplacer_message(
+                query,
+                "⚠️ <b>Analyse du marché en cours...</b>\n\n"
+                "Aucune opportunité détectée.\n\n"
+                "Réessayez dans quelques minutes.",
+                bouton_signal(
+                    restants=user.get("restants"),
+                    vip=user.get("vip", False),
+                    illimite=abonnement_actif(user),
+                ),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
         await lancer_animation_analyse(query, user_id)
 
         data, uid = get_ou_creer_user(user_id)
@@ -2546,21 +2551,6 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query,
                 texte_compteur_compte(user),
                 bouton_vip(),
-            )
-            sauvegarder_message_id(user_id, msg.message_id)
-            return
-
-        if not opportunite_marche_disponible(user):
-            msg = await remplacer_message(
-                query,
-                "⚠️ <b>Analyse du marché en cours...</b>\n\n"
-                "Aucune opportunité détectée.\n\n"
-                "Réessayez dans quelques minutes.",
-                bouton_signal(
-                    restants=user.get("restants"),
-                    vip=user.get("vip", False),
-                    illimite=abonnement_actif(user),
-                ),
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
@@ -2629,10 +2619,8 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with analyses_lock:
             analyses_en_cours.discard(uid)
 
-
 @handler_securise
 async def compte_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le sous-menu "Mon compte" """
     query = update.callback_query
     user_id = query.from_user.id
     await query.answer()
@@ -2645,10 +2633,8 @@ async def compte_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     sauvegarder_message_id(user_id, msg.message_id)
 
-
 @handler_securise
 async def vip_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le sous-menu "VIP & Support" """
     query = update.callback_query
     user_id = query.from_user.id
     await query.answer()
@@ -2661,10 +2647,8 @@ async def vip_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     sauvegarder_message_id(user_id, msg.message_id)
 
-
 @handler_securise
 async def retour_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Retour au menu principal"""
     query = update.callback_query
     user_id = query.from_user.id
     await query.answer()
@@ -2679,7 +2663,6 @@ async def retour_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bouton_signal(restants=restants, vip=user.get("vip", False), illimite=abonnement_actif(user)),
     )
     sauvegarder_message_id(user_id, msg.message_id)
-
 
 @handler_securise
 async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2708,7 +2691,6 @@ async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bouton_vip_pack(),
     )
     sauvegarder_message_id(user_id, msg.message_id)
-
 
 @handler_securise
 async def historique_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2781,10 +2763,8 @@ async def abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = await remplacer_message(query, texte, bouton_compte())
     sauvegarder_message_id(user_id, msg.message_id)
 
-
 @handler_securise
 async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le message de support officiel premium"""
     query = update.callback_query
     user_id = query.from_user.id
     await query.answer()
@@ -2809,7 +2789,6 @@ async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     sauvegarder_message_id(user_id, msg.message_id)
 
-
 @handler_securise
 async def code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2825,7 +2804,6 @@ async def code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     sauvegarder_message_id(user_id, msg.message_id)
 
-
 @handler_securise
 async def effacer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2834,7 +2812,6 @@ async def effacer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
     except TelegramError:
         logger.info("Message déjà supprimé ou inaccessible.")
-
 
 async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
     admin_id = get_admin_id()
@@ -2879,13 +2856,8 @@ async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
             except TelegramError:
                 logger.exception("Impossible de notifier l'admin pour l'expiration %s.", code)
 
-
 # --- Rapport quotidien ---
 async def envoyer_rapport_journalier(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Envoi quotidien du rapport dans LOG_GROUP_ID.
-    Mise en garde : toute exception est capturée et loggée pour éviter d'arrêter le bot.
-    """
     try:
         if not LOG_GROUP_ID:
             logger.info("LOG_GROUP_ID non configuré — rapport quotidien non envoyé.")
@@ -2893,7 +2865,6 @@ async def envoyer_rapport_journalier(context: ContextTypes.DEFAULT_TYPE):
 
         aujourd_hui = datetime.date.today()
 
-        # Nouveaux clients à partir du journal de sécurité
         nouveaux_clients = 0
         try:
             journal_sec = charger_journal_securite()
@@ -2908,7 +2879,6 @@ async def envoyer_rapport_journalier(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Impossible de lire security_log pour le rapport quotidien.")
 
-        # Ventes aujourd'hui
         recharges_count = 0
         abonnements_count = 0
         total_signaux_recharges = 0
@@ -2960,7 +2930,6 @@ async def envoyer_rapport_journalier(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Erreur lors de l'envoi du rapport quotidien.")
 # --- Fin rapport quotidien ---
 
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -2970,18 +2939,15 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-
 def lancer_serveur():
     port = int(os.environ.get("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     logger.info("Serveur de santé démarré sur le port %s.", port)
     server.serve_forever()
 
-
 async def supprimer_webhook(application: Application):
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("Webhook supprimé. Démarrage du polling.")
-
 
 def creer_application():
     if not TOKEN:
@@ -3006,6 +2972,8 @@ def creer_application():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("admin", admin_help))
+    # Nouvelle commande createclient
+    app.add_handler(CommandHandler("createclient", createclient_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_message))
     
     # Handlers de callback - Menu principal
@@ -3026,13 +2994,10 @@ def creer_application():
     app.add_error_handler(error_handler)
 
     if app.job_queue:
-        # Vérifier les expirations une fois par jour
         app.job_queue.run_repeating(verifier_expirations, interval=86400, first=60)
 
-        # Planifier l'envoi quotidien du rapport à 23:59 UTC (Côte d'Ivoire = UTC+0)
         try:
             report_time = datetime.time(23, 59, tzinfo=datetime.timezone.utc)
-            # run_daily enregistre la tâche tous les jours à l'heure fournie (avec timezone)
             app.job_queue.run_daily(envoyer_rapport_journalier, time=report_time, name="daily_report")
             logger.info("Job quotidien d'envoi du rapport enregistré pour 23:59 UTC.")
         except Exception:
@@ -3041,7 +3006,6 @@ def creer_application():
         logger.warning("Job queue indisponible. Vérifie python-telegram-bot[job-queue] dans requirements.txt.")
 
     return app
-
 
 def main():
     threading.Thread(target=lancer_serveur, daemon=True).start()
@@ -3054,7 +3018,6 @@ def main():
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
-
 
 if __name__ == "__main__":
     main()
