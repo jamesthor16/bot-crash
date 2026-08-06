@@ -1287,49 +1287,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Erreur Telegram non interceptée.", exc_info=context.error)
 
 def est_admin(update: Update):
-    """
-    Retourne True si l'utilisateur est l'administrateur.
-    1) Vérifie ADMIN_ID (variable d'environnement) si définie.
-    2) Vérifie l'ID enregistré via sauvegarder_admin_id (fichier/DB).
-    3) Fallback : compare le username avec ADMIN_USERNAME (variable d'env).
-    """
-    if not update.effective_user:
-        return False
-
-    # ID Telegram de l'utilisateur courant
-    try:
-        uid = int(update.effective_user.id)
-    except Exception:
-        uid = None
-
-    # Username sans @
-    username = (update.effective_user.username or "").lstrip("@")
-
-    # 1) ADMIN_ID depuis la variable d'environnement (optionnel)
-    admin_id_env = os.environ.get("ADMIN_ID")
-    if admin_id_env:
-        try:
-            if uid is not None and int(admin_id_env) == uid:
-                return True
-        except Exception:
-            # ignore invalid env value
-            pass
-
-    # 2) ID administrateur sauvegardé (via /admin qui appelle sauvegarder_admin_id)
-    try:
-        admin_id_saved = get_admin_id()
-        if admin_id_saved:
-            try:
-                if uid is not None and int(admin_id_saved) == uid:
-                    return True
-            except Exception:
-                # ignore conversion problems
-                pass
-    except Exception:
-        # Si lecture admin_id échoue, on continue vers le fallback
-        logger.exception("Impossible de lire l'admin_id pendant la vérification admin.")
-
-    # 3) Fallback : comparaison du username
+    username = update.effective_user.username if update.effective_user else None
     return username == ADMIN_USERNAME
 
 async def refuser_non_admin(update: Update):
@@ -1718,23 +1676,9 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
 async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Génère automatiquement un client (code + enregistrement DB) et renvoie le lien d'invitation.
-    Protection admin faite en interne (pas de @handler_securise) pour éviter que controler_acces_client
-    n'intercepte la commande avant la vérification et pour produire des logs de diagnostic.
+    Si PostgreSQL indisponible, refuse la création et loggue l'erreur (ne crée rien).
     """
-    # Vérifier l'administrateur explicitement
     if not est_admin(update):
-        # Log détaillé pour debug
-        try:
-            uid = getattr(update.effective_user, "id", None)
-            username = (getattr(update.effective_user, "username", "") or "").lstrip("@")
-            admin_id_env = os.environ.get("ADMIN_ID")
-            admin_id_saved = get_admin_id()
-            logger.warning(
-                "Tentative /createclient refusée. caller uid=%s username=%s ADMIN_ID_env=%s admin_id_saved=%s",
-                uid, username, admin_id_env, admin_id_saved,
-            )
-        except Exception:
-            logger.exception("Impossible d'observer les métadonnées de l'appelant pour /createclient.")
         await refuser_non_admin(update)
         return
 
@@ -1749,7 +1693,6 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Charger et migrer les users (s'assurer qu'il n'y a pas de doublon)
     data = migrer_si_besoin(charger_users())
-
     # Générer code unique
     code = generer_code_unique(data)
     maintenant = datetime.datetime.now().isoformat()
@@ -1804,8 +1747,10 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    logger.info("Nouveau client créé: code=%s par uid=%s", code, getattr(update.effective_user, "id", None))
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
+
+# --- FIN createclient ---
+
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -3005,8 +2950,8 @@ async def supprimer_webhook(application: Application):
     logger.info("Webhook supprimé. Démarrage du polling.")
 
 def creer_application():
-     if not TOKEN:
-      raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
+    if not TOKEN:
+        raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
     
     app = ApplicationBuilder().token(TOKEN).post_init(supprimer_webhook).build()
     app.add_handler(CommandHandler("start", start))
