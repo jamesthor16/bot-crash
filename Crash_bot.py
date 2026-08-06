@@ -1787,7 +1787,7 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid_cible = trouver_uid_par_code(data, code_cible)
 
     if uid_cible is None:
-        await update.message.reply_text(f"�❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
     user_cible = data[uid_cible]
@@ -2962,7 +2962,7 @@ async def supprimer_webhook(application: Application):
 
 def creer_application():
     if not TOKEN:
-        raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
+        raise RuntimeError("La variable d'environnement TOKEN est obligatoire.")
     
     app = ApplicationBuilder().token(TOKEN).post_init(supprimer_webhook).build()
     app.add_handler(CommandHandler("start", start))
