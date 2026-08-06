@@ -1351,40 +1351,35 @@ async def notifier_tentative_connexion(context: ContextTypes.DEFAULT_TYPE, code,
 # CONTROL D'ACCES PRINCIPAL
 async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    - Si admin => accès.
-    - Si message /start CODE : on tente d'associer le code (uniquement si code existe).
+    - Si message /start CODE : tenter d'associer le code (même si admin).
+    - Sinon : admin => accès (bypass).
     - Si utilisateur déjà associé (telegram_id présent) => accès.
     - Sinon : bloqué et affiche le message d'accès privé.
     """
-    # Admin bypass
-    if not update.effective_user or est_admin(update):
-        return True
-
+    # Récupérer code si présent dans /start (on veut traiter l'association en priorité)
     code_start = None
     if update.effective_message and update.effective_message.text:
         morceaux = update.effective_message.text.split()
         if morceaux and morceaux[0].split("@")[0].lower() == "/start" and len(morceaux) > 1:
             code_start = morceaux[1].upper()
 
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id if update.effective_user else None
 
-    # Si on a un code dans le start => tenter d'associer
-    if code_start:
+    # Si on a un code dans le start => tenter d'associer (TOUJOURS, même pour l'admin)
+    if code_start and user_id is not None:
         data, uid, statut, ancien = associer_ou_creer_user(user_id, code_cible=code_start)
         if statut == "invalid_code":
-            # Code inconnu -> refuser accès (invite invalide)
             await envoyer_message_acces(
                 update,
                 "❌ L'invitation fournie est invalide.\n\nVeuillez contacter l'administrateur.",
             )
             return False
         if statut == "device_locked":
-            code = code_start
             await envoyer_message_acces(
                 update,
                 "❌ Ce lien d'invitation est déjà utilisé.\n\nVeuillez contacter l'administrateur.",
             )
-            await notifier_tentative_connexion(context, code, ancien, user_id)
+            await notifier_tentative_connexion(context, code_start, ancien, user_id)
             return False
         if statut == "banned":
             await envoyer_message_acces(
@@ -1401,16 +1396,18 @@ async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_T
         )
         return False
 
-    # Pas de code fourni : vérifier si l'utilisateur est déjà associé
+    # Pas de code fourni : admin bypass (accès immédiat)
+    if not update.effective_user or est_admin(update):
+        return True
+
+    # Pas de code fourni et pas admin : vérifier si l'utilisateur est déjà associé
     data = migrer_si_besoin(charger_users())
     uid = str(user_id)
     if uid in data:
-        # utilisateur existant
         user = data[uid]
         if user.get("banned", False):
             await envoyer_message_acces(update, "🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.")
             return False
-        # OK
         return True
 
     # Sinon : accès privé (aucun menu, aucun bouton)
@@ -1424,7 +1421,6 @@ async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_T
     )
     await envoyer_message_acces(update, private_msg)
     return False
-
 @handler_securise
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
