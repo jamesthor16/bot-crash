@@ -450,6 +450,30 @@ def charger_users():
 def sauvegarder_users(data):
     ecrire_json(DATA_FILE, data)
 
+def safe_sauvegarder_users(data):
+    """
+    Tente de sauvegarder via la voie normale (Postgres si dispo).
+    En cas d'erreur, force la sauvegarde sur fichier JSON local et met à jour le cache.
+    Ceci garantit que la création/association marche même si Postgres est down.
+    """
+    try:
+        # sauvegarder_users utilise ecrire_json qui bascule en JSON si Postgres indisponible,
+        # mais cette opération peut encore lever une exception dans certains cas -> on capture.
+        sauvegarder_users(data)
+        return True
+    except Exception as exc:
+        logger.exception("Erreur en sauvegardant via la voie normale, bascule vers fichier JSON local.", exc_info=exc)
+        try:
+            # Forcer écriture sur fichier local (atomic)
+            ecrire_json_fichier(DATA_FILE, data)
+            with storage_lock:
+                storage_cache[DATA_FILE] = data
+            logger.info("Sauvegarde locale (JSON) réussie.")
+            return True
+        except Exception as exc2:
+            logger.exception("Echec de la sauvegarde locale JSON.", exc_info=exc2)
+            return False
+
 def charger_journal_securite():
     journal = lire_json(SECURITY_LOG_FILE, [])
     return journal if isinstance(journal, list) else []
@@ -844,7 +868,7 @@ def associer_ou_creer_user(user_id, code_cible=None):
 # Après changement : get_ou_creer_user devient simple récupérateur. Les validations d'accès se font
 # dans controler_acces_client (via associer_ou_creer_user)
 def get_ou_creer_user(user_id, code_cible=None):
-    data = migrer_si_besoin(charger_users())
+    data = migrer_si_besoin(charger_users())  # recharge à chaque appel
     uid = str(user_id)
     return data, uid
 
@@ -1675,25 +1699,13 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
 @handler_securise
 async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Génère automatiquement un client (code + enregistrement) et renvoie le lien d'invitation.
-    Si PostgreSQL est indisponible on utilise le stockage JSON local (users.json) comme fallback
-    — on ne bloque plus la création. On logge toujours l'état pour diagnostics.
+    Génère automatiquement un client (code + enregistrement DB ou JSON fallback) et renvoie le lien d'invitation.
     """
     if not est_admin(update):
         await refuser_non_admin(update)
         return
 
-    # Tenter d'initialiser la DB uniquement pour information (ne bloque pas la création)
-    db_ok = False
-    try:
-        db_ok = initialiser_base_de_donnees()
-    except Exception:
-        logger.exception("Erreur pendant initialiser_base_de_donnees() (création client). Continuer en fallback JSON.")
-
-    if not db_ok:
-        logger.warning("PostgreSQL indisponible — création du client dans le stockage local (JSON).")
-
-    # Charger et migrer les users (migrer_si_besoin marche sur le backend disponible : Postgres ou JSON)
+    # Charger et migrer les users (s'assurer qu'il n'y a pas de doublon)
     data = migrer_si_besoin(charger_users())
 
     # Générer code unique
@@ -1718,10 +1730,8 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "invitation_used": False,
     }
 
-    try:
-        sauvegarder_users(data)
-    except Exception as exc:
-        logger.exception("Erreur lors de l'enregistrement du nouveau client (createclient).", exc_info=exc)
+    ok = safe_sauvegarder_users(data)
+    if not ok:
         await update.message.reply_text(
             "❌ Erreur lors de l'enregistrement du client. Vérifiez les logs.",
             parse_mode=ParseMode.HTML,
@@ -1747,13 +1757,11 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🔗 Lien d'invitation\n\n"
         f"{lien}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Stockage : {'PostgreSQL' if db_ok else 'JSON local (fallback)'}"
+        "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    logger.info("Nouveau client créé: code=%s by uid=%s storage=%s", code, getattr(update.effective_user, "id", None), 'postgres' if db_ok else 'json')
+    logger.info("Nouveau client créé: code=%s par uid=%s", code, getattr(update.effective_user, "id", None))
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
-
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
