@@ -40,6 +40,8 @@ ANALYSE_MAX_SECONDS = 15
 HISTORIQUE_LIMIT = 100
 SIGNAL_MEMORY_LIMIT = 20
 OPPORTUNITE_REFUS_PROBABILITY = 0.07
+SAFE_DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+POSTGRES_SCHEMA = os.getenv("CRASH_DB_SCHEMA", "crash")
 
 # Configuration du groupe de journalisation (0 = désactivé)
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))  # mettre -100... dans l'env pour activer
@@ -82,6 +84,14 @@ analyses_lock = threading.Lock()
 analyses_en_cours = set()
 signal_history_lock = threading.Lock()
 derniers_signaux_generes = []
+
+def identifiant_sql_sur(schema):
+    if not SAFE_DB_IDENTIFIER_RE.match(schema or ""):
+        raise RuntimeError("Nom de schema PostgreSQL invalide.")
+    return schema
+
+def schema_postgres():
+    return identifiant_sql_sur(POSTGRES_SCHEMA)
 
 def copie_defaut(default):
     if isinstance(default, dict):
@@ -158,7 +168,13 @@ def get_db_pool():
             PsycopgConnectionPool = importlib.import_module("psycopg_pool").ConnectionPool
             PsycopgJsonb = importlib.import_module("psycopg.types.json").Jsonb
             Jsonb = PsycopgJsonb
-            db_pool = PsycopgConnectionPool(database_url, min_size=1, max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")))
+            schema = schema_postgres()
+            db_pool = PsycopgConnectionPool(
+                database_url,
+                min_size=1,
+                max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")),
+                kwargs={"options": f"-c search_path={schema}"},
+            )
         except Exception as exc:
             logger.warning("PostgreSQL indisponible (%s). Utilisation du stockage JSON.", exc)
             db_disabled = True
@@ -187,6 +203,9 @@ def initialiser_base_de_donnees():
         try:
             with pool.connection() as conn:
                 with conn.cursor() as cur:
+                    schema = schema_postgres()
+                    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+                    cur.execute(f'SET search_path TO "{schema}"')
                     cur.execute(
                         """
                         CREATE TABLE IF NOT EXISTS users (
@@ -253,6 +272,20 @@ def migrer_json_vers_postgres_si_vide():
             cur.execute("SELECT COUNT(*) FROM users")
             users_vide = cur.fetchone()[0] == 0
             if users_vide:
+                cur.execute("SELECT to_regclass('public.users')")
+                public_users_existe = cur.fetchone()[0] is not None
+                if public_users_existe:
+                    cur.execute(
+                        """
+                        INSERT INTO users (user_key, telegram_id, username, code_client, data, updated_at)
+                        SELECT user_key, telegram_id, username, code_client, data, updated_at
+                        FROM public.users
+                        ON CONFLICT (user_key) DO NOTHING
+                        """
+                    )
+                    cur.execute("SELECT COUNT(*) FROM users")
+                    users_vide = cur.fetchone()[0] == 0
+            if users_vide:
                 users_importes = {}
                 for path in chemins_migration_json(DATA_FILE, "crash_users.json"):
                     donnees = lire_json_migration(path, {})
@@ -264,6 +297,20 @@ def migrer_json_vers_postgres_si_vide():
 
             cur.execute("SELECT COUNT(*) FROM administrateurs")
             admins_vide = cur.fetchone()[0] == 0
+            if admins_vide:
+                cur.execute("SELECT to_regclass('public.administrateurs')")
+                public_admins_existe = cur.fetchone()[0] is not None
+                if public_admins_existe:
+                    cur.execute(
+                        """
+                        INSERT INTO administrateurs (key, data, updated_at)
+                        SELECT key, data, updated_at
+                        FROM public.administrateurs
+                        ON CONFLICT (key) DO NOTHING
+                        """
+                    )
+                    cur.execute("SELECT COUNT(*) FROM administrateurs")
+                    admins_vide = cur.fetchone()[0] == 0
             if admins_vide:
                 admin_data = {}
                 for path in chemins_migration_json(ADMIN_ID_FILE, "crash_admin_id.json"):
@@ -283,6 +330,20 @@ def migrer_json_vers_postgres_si_vide():
 
             cur.execute("SELECT COUNT(*) FROM statistiques")
             stats_vides = cur.fetchone()[0] == 0
+            if stats_vides:
+                cur.execute("SELECT to_regclass('public.statistiques')")
+                public_stats_existe = cur.fetchone()[0] is not None
+                if public_stats_existe:
+                    cur.execute(
+                        """
+                        INSERT INTO statistiques (key, data, updated_at)
+                        SELECT key, data, updated_at
+                        FROM public.statistiques
+                        ON CONFLICT (key) DO NOTHING
+                        """
+                    )
+                    cur.execute("SELECT COUNT(*) FROM statistiques")
+                    stats_vides = cur.fetchone()[0] == 0
             if stats_vides:
                 data_stats = lire_json_migration("data.json", {})
                 journal = lire_json_migration(SECURITY_LOG_FILE, [])
@@ -323,7 +384,7 @@ def valeur_entier(data, *cles):
                 return None
     return None
 
-def sauvegarder_users_postgres(cur, data, supprimer_absents=True):
+def sauvegarder_users_postgres(cur, data, supprimer_absents=False):
     cles = []
     for uid, user in data.items():
         if not isinstance(user, dict):
@@ -940,6 +1001,13 @@ def formater_date(ts):
     ts = timestamp_ou_none(ts) or datetime.datetime.now().timestamp()
     return datetime.datetime.fromtimestamp(ts).strftime("%d/%m/%Y")
 
+def parser_date_expiration(texte):
+    try:
+        date_expiration = datetime.datetime.strptime((texte or "").strip(), "%d/%m/%Y")
+    except ValueError:
+        return None
+    return date_expiration.replace(hour=23, minute=59, second=59, microsecond=0)
+
 def jours_restants_jusqua(ts, maintenant=None):
     ts = timestamp_ou_none(ts)
     if not ts:
@@ -1124,67 +1192,51 @@ async def lancer_animation_analyse(query, user_id):
 
     return message
 
-def delai_signal_depuis_coefficient(coefficient):
-    if coefficient >= 3.10:
-        return 4
-    if coefficient >= 2.70:
-        return 5
-    if coefficient >= 2.25:
-        return 6
-    return 7
+def generer_multiplicateur_pondere_crash():
+    """Distribution : 1.50–2.00x (45%) | 2.00–2.50x (30%) | 2.50–3.50x (17%) | 3.50–5.00x (8%)"""
+    plages = [
+        (1.50, 2.00, 0.45),
+        (2.00, 2.50, 0.30),
+        (2.50, 3.50, 0.17),
+        (3.50, 5.00, 0.08),
+    ]
+    poids = [p[2] for p in plages]
+    plage_index = random.choices(range(len(plages)), weights=poids, k=1)[0]
+    low, high, _ = plages[plage_index]
+    return round(random.uniform(low, high), 2)
 
-def generer_multiplicateur_pondere():
-    plage = random.choices(
-        population=[
-            (2.00, 2.30),
-            (2.31, 2.80),
-            (2.81, 3.20),
-            (3.21, 3.50),
-        ],
-        weights=[45, 35, 15, 5],
-        k=1,
-    )[0]
-    return round(random.uniform(*plage), 2)
+def generer_assurance_crash(coefficient):
+    """Assurance 1.50–4.00x, jamais > coefficient"""
+    return round(random.uniform(1.50, min(4.00, coefficient)), 2)
 
-def multiplicateur_trop_proche(coefficient, deja_vus):
-    return any(abs(float(coefficient) - float(valeur)) < 0.06 for valeur in deja_vus[-6:])
-
-def generer_assurance_intelligente(coefficient):
-    ratio = (coefficient - 2.00) / 1.50
-    centre = 1.62 + (ratio * 0.72)
-    assurance = random.gauss(centre, 0.14)
-    assurance = max(1.50, min(2.50, assurance))
-    assurance = min(assurance, coefficient - 0.22)
-    return round(max(1.50, min(2.50, assurance)), 2)
+def delai_signal_crash(coefficient):
+    """2–5 min selon coefficient"""
+    c = float(coefficient) if isinstance(coefficient, (int, float)) else 0
+    if c >= 4.00: return 2
+    if c >= 3.00: return 3
+    if c >= 2.00: return 4
+    return 5
 
 def generer_signal(user=None):
     heure_date = datetime.datetime.now()
-
-    deja_vus = derniers_multiplicateurs(user or {})
-    coefficient_number = generer_multiplicateur_pondere()
-    for _ in range(20):
-        if not multiplicateur_trop_proche(coefficient_number, deja_vus):
-            break
-        coefficient_number = generer_multiplicateur_pondere()
-
-    assurance = generer_assurance_intelligente(coefficient_number)
-    heure_date = heure_date + datetime.timedelta(minutes=delai_signal_depuis_coefficient(coefficient_number))
-    separateur = "\u2501" * 22
-    memoriser_signal_interne(coefficient_number)
+    coefficient_number = generer_multiplicateur_pondere_crash()
+    assurance = generer_assurance_crash(coefficient_number)
+    minutes = delai_signal_crash(coefficient_number)
+    heure_date = heure_date + datetime.timedelta(minutes=minutes)
 
     message = (
-        f"{separateur}\n"
-        "\U0001f4a5 <b>CRASH AI</b>\n"
-        f"{separateur}\n\n"
-        "\U0001f3af <b>Multiplicateur</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💥 <b>CRASH AI</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 <b>Multiplicateur</b>\n"
         f"<code>{coefficient_number:.2f}x</code>\n\n"
-        "\U0001f6e1 <b>Assurance</b>\n"
+        "🛡 <b>Assurance</b>\n"
         f"<code>{assurance:.2f}x</code>\n\n"
-        "\U0001f552 <b>Heure</b>\n"
+        "🕒 <b>Heure</b>\n"
         f"<code>{formater_heure_signal(heure_date)}</code>\n\n"
-        f"{separateur}\n"
-        "\u2705 <b>Signal pr\u00eat</b>\n"
-        f"{separateur}"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "✅ <b>Analyse terminée</b>\n"
+        "━━━━━━━━━━━━━━━━━━"
     )
     return message, True
 
@@ -1523,19 +1575,45 @@ def bouton_choix_limite_journaliere():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Oui", callback_data="daily_limit_yes"),
-                InlineKeyboardButton("❌ Non", callback_data="daily_limit_no"),
+                InlineKeyboardButton("Avec limitation", callback_data="daily_limit_yes"),
+                InlineKeyboardButton("Sans limitation", callback_data="daily_limit_no"),
             ]
+        ]
+    )
+
+def bouton_choix_date_abonnement():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Modifier la date", callback_data="subscription_date_modify")],
+            [InlineKeyboardButton("Conserver la date actuelle", callback_data="subscription_date_keep")],
         ]
     )
 
 async def demander_limite_journaliere(update, code_cible, operation, nombre=None):
     details = f"\n\nSignaux : <b>{nombre}</b>" if nombre is not None else ""
     await update.message.reply_text(
-        "Souhaitez-vous activer une limitation quotidienne ?\n"
+        "Gestion de la limitation quotidienne\n\n"
         f"Client : <code>{echapper_html_texte(code_cible)}</code>{details}",
         parse_mode=ParseMode.HTML,
         reply_markup=bouton_choix_limite_journaliere(),
+    )
+
+async def demander_date_abonnement(context, chat_id, pending):
+    code_cible = pending.get("code")
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    date_actuelle = "-"
+    if uid_cible is not None and data[uid_cible].get("vip_fin"):
+        date_actuelle = formater_date(data[uid_cible].get("vip_fin"))
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Gestion de la date d'expiration\n\n"
+            f"Client : <code>{echapper_html_texte(code_cible)}</code>\n"
+            f"Date actuelle : <b>{echapper_html_texte(date_actuelle)}</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_choix_date_abonnement(),
     )
 
 async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, limite_jour=None):
@@ -1611,7 +1689,7 @@ async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, l
 
     await _envoyer_notification_groupe(context, notif)
 
-async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_jour=None):
+async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_jour=None, expiration=None, conserver_date=False):
     data = migrer_si_besoin(charger_users())
     uid_cible = trouver_uid_par_code(data, code_cible)
     if uid_cible is None:
@@ -1623,12 +1701,29 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
         return
 
     maintenant = datetime.datetime.now()
-    fin = maintenant + datetime.timedelta(days=30)
     user_cible = data[uid_cible]
+    ancienne_fin = timestamp_ou_none(user_cible.get("vip_fin"))
+    if conserver_date and ancienne_fin:
+        fin = datetime.datetime.fromtimestamp(ancienne_fin)
+    elif conserver_date:
+        await context.bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                "Aucune date actuelle n'existe pour ce client.\n\n"
+                "Relancez <code>/abonnement CODE</code> puis choisissez <b>Modifier la date</b>."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    elif expiration is not None:
+        fin = expiration
+    else:
+        fin = maintenant + datetime.timedelta(days=30)
     normaliser_signaux_gratuits(user_cible)
     user_cible["vip"] = True
     user_cible["illimite"] = True
-    user_cible["vip_debut"] = maintenant.timestamp()
+    if not conserver_date or not user_cible.get("vip_debut"):
+        user_cible["vip_debut"] = maintenant.timestamp()
     user_cible["vip_fin"] = fin.timestamp()
     user_cible["vip_signals"] = 0
     user_cible["restants"] = None
@@ -1676,7 +1771,8 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
         admin_name = str(admin_chat_id)
 
     price_fcfa = ABONNEMENT_PRICE
-    journaliser_abonnement(code_cible, admin_name, duree_jours=30, price_fcfa=price_fcfa)
+    duree_jours = max(0, jours_restants_jusqua(fin.timestamp(), maintenant=maintenant))
+    journaliser_abonnement(code_cible, admin_name, duree_jours=duree_jours or 30, price_fcfa=price_fcfa)
 
     notif = (
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2275,7 +2371,20 @@ async def finaliser_action_limite_journaliere(context, chat_id, pending, limite_
     if operation == "recharge":
         await appliquer_recharge_admin(context, chat_id, code_cible, int(pending.get("nombre", 0)), limite_jour)
     elif operation == "abonnement":
-        await appliquer_abonnement_admin(context, chat_id, code_cible, limite_jour)
+        pending["limite_jour"] = limite_jour
+        await demander_date_abonnement(context, chat_id, pending)
+
+async def finaliser_abonnement_avec_date(context, chat_id, pending, expiration=None, conserver_date=False):
+    code_cible = pending.get("code")
+    limite_jour = pending.get("limite_jour")
+    await appliquer_abonnement_admin(
+        context,
+        chat_id,
+        code_cible,
+        limite_jour=limite_jour,
+        expiration=expiration,
+        conserver_date=conserver_date,
+    )
 
 @handler_securise
 async def choix_limite_journaliere_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2291,8 +2400,9 @@ async def choix_limite_journaliere_callback(update: Update, context: ContextType
         return
 
     if query.data == "daily_limit_no":
-        context.user_data.pop("daily_limit_pending", None)
         await query.edit_message_text("Limitation quotidienne desactivee. Application en cours...", parse_mode=ParseMode.HTML)
+        if pending.get("operation") != "abonnement":
+            context.user_data.pop("daily_limit_pending", None)
         await finaliser_action_limite_journaliere(context, query.message.chat_id, pending, limite_jour=None)
         return
 
@@ -2300,6 +2410,32 @@ async def choix_limite_journaliere_callback(update: Update, context: ContextType
     await query.edit_message_text(
         "Combien de signaux maximum par jour ?\n\n"
         "Exemple : <code>5</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+@handler_securise
+async def choix_date_abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    pending = context.user_data.get("daily_limit_pending")
+    if not pending or pending.get("operation") != "abonnement":
+        await query.edit_message_text("Aucun abonnement en attente.", parse_mode=ParseMode.HTML)
+        return
+
+    if query.data == "subscription_date_keep":
+        context.user_data.pop("daily_limit_pending", None)
+        await query.edit_message_text("Date actuelle conservee. Application en cours...", parse_mode=ParseMode.HTML)
+        await finaliser_abonnement_avec_date(context, query.message.chat_id, pending, conserver_date=True)
+        return
+
+    context.user_data["subscription_date_waiting"] = True
+    await query.edit_message_text(
+        "Envoyez la nouvelle date d'expiration au format <code>JJ/MM/AAAA</code>.\n\n"
+        "Exemple : <code>25/08/2026</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -2322,18 +2458,48 @@ async def limite_journaliere_message(update: Update, context: ContextTypes.DEFAU
         return True
 
     pending = context.user_data.get("daily_limit_pending")
-    context.user_data.pop("daily_limit_pending", None)
     context.user_data.pop("daily_limit_waiting_number", None)
     if not pending:
         await update.message.reply_text("Aucune action en attente.", parse_mode=ParseMode.HTML)
         return True
 
+    if pending.get("operation") != "abonnement":
+        context.user_data.pop("daily_limit_pending", None)
     await finaliser_action_limite_journaliere(context, update.effective_chat.id, pending, limite_jour=limite_jour)
+    return True
+
+@handler_securise
+async def date_abonnement_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("subscription_date_waiting"):
+        return False
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return True
+
+    expiration = parser_date_expiration(update.message.text)
+    if expiration is None:
+        await update.message.reply_text(
+            "Date invalide. Envoyez une date au format <code>JJ/MM/AAAA</code>.\n\n"
+            "Exemple : <code>25/08/2026</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    pending = context.user_data.get("daily_limit_pending")
+    context.user_data.pop("daily_limit_pending", None)
+    context.user_data.pop("subscription_date_waiting", None)
+    if not pending or pending.get("operation") != "abonnement":
+        await update.message.reply_text("Aucun abonnement en attente.", parse_mode=ParseMode.HTML)
+        return True
+
+    await finaliser_abonnement_avec_date(context, update.effective_chat.id, pending, expiration=expiration)
     return True
 
 @handler_securise
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await limite_journaliere_message(update, context):
+        return
+    if await date_abonnement_message(update, context):
         return
     if not context.user_data.get("broadcast_waiting"):
         return
@@ -2985,6 +3151,7 @@ def creer_application():
     
     # Handlers de callback - Menu principal
     app.add_handler(CallbackQueryHandler(choix_limite_journaliere_callback, pattern="^daily_limit_(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(choix_date_abonnement_callback, pattern="^subscription_date_(modify|keep)$"))
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
     app.add_handler(CallbackQueryHandler(compte_menu_callback, pattern="^compte_menu$"))
     app.add_handler(CallbackQueryHandler(vip_menu_callback, pattern="^vip_menu$"))
