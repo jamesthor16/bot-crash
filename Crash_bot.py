@@ -13,6 +13,7 @@ import threading
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from json import JSONDecodeError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -42,6 +43,7 @@ SIGNAL_MEMORY_LIMIT = 20
 OPPORTUNITE_REFUS_PROBABILITY = 0.07
 SAFE_DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 POSTGRES_SCHEMA = os.getenv("CRASH_DB_SCHEMA", "crash")
+CRASH_TIMEZONE = os.getenv("CRASH_TIMEZONE", "Africa/Abidjan")
 
 # Configuration du groupe de journalisation (0 = désactivé)
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))  # mettre -100... dans l'env pour activer
@@ -636,6 +638,83 @@ def entier_positif(valeur, defaut=0, maximum=None):
         nombre = min(nombre, maximum)
     return nombre
 
+def timezone_crash():
+    try:
+        return ZoneInfo(CRASH_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        logger.warning("Fuseau horaire CRASH_TIMEZONE invalide (%s). UTC utilise.", CRASH_TIMEZONE)
+        return datetime.timezone.utc
+
+def maintenant_crash():
+    return datetime.datetime.now(timezone_crash())
+
+def planning_crash(maintenant=None):
+    maintenant = maintenant or maintenant_crash()
+    if maintenant.weekday() in (2, 6):
+        return {
+            "actif": False,
+            "type": "journee",
+            "prochaine_session": "demain",
+        }
+
+    heure = maintenant.time()
+    if datetime.time(12, 0) <= heure < datetime.time(14, 0):
+        return {
+            "actif": False,
+            "type": "midi",
+            "prochaine_session": "14h00",
+        }
+    if datetime.time(21, 0) <= heure < datetime.time(22, 0):
+        return {
+            "actif": False,
+            "type": "soir",
+            "prochaine_session": "22h00",
+        }
+
+    return {
+        "actif": True,
+        "type": "actif",
+        "prochaine_session": None,
+    }
+
+def bot_crash_actif(maintenant=None):
+    return planning_crash(maintenant)["actif"]
+
+def texte_mise_a_jour_crash(etat=None):
+    etat = etat or planning_crash()
+    if etat.get("type") == "journee":
+        return (
+            "💥 <b>CRASH</b>\n\n"
+            "🔄 <b>MISE À JOUR DU SYSTÈME</b>\n\n"
+            "🇷🇺 <b>ОБНОВЛЕНИЕ СИСТЕМЫ</b>\n\n"
+            "Le bot est actuellement en mise à jour\n"
+            "afin d'améliorer les prochaines analyses.\n\n"
+            "🚫 Aucun signal n'est disponible aujourd'hui.\n\n"
+            "⏰ Revenez demain pour retrouver les signaux.\n\n"
+            "Merci pour votre patience. ❤️"
+        )
+
+    if etat.get("type") == "soir":
+        return (
+            "💥 <b>CRASH</b>\n\n"
+            "🔄 <b>MISE À JOUR DU SOIR</b>\n\n"
+            "🇷🇺 <b>ВЕЧЕРНЕЕ ОБНОВЛЕНИЕ</b>\n\n"
+            "Le système analyse les nouvelles données\n"
+            "pour améliorer les prochains signaux.\n\n"
+            "⏰ Prochaine session : 22h00\n\n"
+            "Vos signaux restent conservés."
+        )
+
+    return (
+        "💥 <b>CRASH</b>\n\n"
+        "🔄 <b>MISE À JOUR</b>\n\n"
+        "🇷🇺 <b>ОБНОВЛЕНИЕ</b>\n\n"
+        "Le système analyse actuellement les données\n"
+        "pour améliorer les prochains signaux.\n\n"
+        "⏰ Prochaine session : 14h00\n\n"
+        "Vos signaux restent entièrement conservés."
+    )
+
 def timestamp_ou_none(valeur):
     try:
         return float(valeur)
@@ -686,7 +765,7 @@ def normaliser_signaux_vip(user):
     return user["vip_signals"]
 
 def date_limite_journaliere():
-    return datetime.datetime.now().strftime("%Y-%m-%d")
+    return maintenant_crash().strftime("%Y-%m-%d")
 
 def normaliser_limite_journaliere(user):
     limite = entier_positif(user.get("daily_limit_max", 0))
@@ -953,7 +1032,7 @@ def consommer_signal(user_id, signal_txt=None):
         return {"restants": user.get("restants"), "mode": "limite_journaliere", "illimite": abonnement_actif(user)}
 
     if abonnement_actif(user):
-        user["dernier_signal"] = datetime.datetime.now().timestamp()
+        user["dernier_signal"] = maintenant_crash().timestamp()
         user["illimite"] = True
         utilises, limite, active = normaliser_limite_journaliere(user)
         if active:
@@ -981,7 +1060,7 @@ def consommer_signal(user_id, signal_txt=None):
         mode = "gratuit"
         restants_apres = gratuits
 
-    user["dernier_signal"] = datetime.datetime.now().timestamp()
+    user["dernier_signal"] = maintenant_crash().timestamp()
     utilises, limite, active = normaliser_limite_journaliere(user)
     if active:
         user["daily_used"] = min(limite, utilises + 1)
@@ -994,12 +1073,12 @@ def get_secondes_restantes(user):
     dernier = timestamp_ou_none(user.get("dernier_signal"))
     if not dernier:
         return 0
-    ecoule = datetime.datetime.now().timestamp() - dernier
+    ecoule = maintenant_crash().timestamp() - dernier
     return max(0, int(COOLDOWN_SECONDS - ecoule))
 
 def formater_date(ts):
-    ts = timestamp_ou_none(ts) or datetime.datetime.now().timestamp()
-    return datetime.datetime.fromtimestamp(ts).strftime("%d/%m/%Y")
+    ts = timestamp_ou_none(ts) or maintenant_crash().timestamp()
+    return datetime.datetime.fromtimestamp(ts, tz=timezone_crash()).strftime("%d/%m/%Y")
 
 def parser_date_expiration(texte):
     try:
@@ -1016,7 +1095,9 @@ def jours_restants_jusqua(ts, maintenant=None):
     return max(0, (datetime.datetime.fromtimestamp(ts) - maintenant).days)
 
 def formater_heure_signal(dt):
-    return dt.strftime("%H:%M")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone_crash())
+    return dt.astimezone(timezone_crash()).strftime("%H:%M")
 
 def niveau_depuis_coefficient(coefficient):
     if coefficient >= 9:
@@ -1134,9 +1215,10 @@ def texte_analyse(etape, pourcentage, titres=None):
     titres = titres or [
         "\U0001f680 Connexion au serveur Crash...",
         "\U0001f4ca Analyse des derniers Crash...",
+        "🇷🇺 СИСТЕМА АКТИВНА - Système actif.",
         "\U0001f9e0 Calcul du multiplicateur...",
         "\u2699\ufe0f Validation du signal...",
-        "\u2705 Analyse termin\u00e9e.",
+        "\u2705 🇷🇺 АНАЛИЗ ЗАВЕРШЁН - Analyse termin\u00e9e.",
     ]
     total = len(titres)
     points = "\u25cf" * (etape + 1) + "\u25cb" * max(0, total - etape - 1)
@@ -1161,6 +1243,7 @@ async def lancer_animation_analyse(query, user_id):
     )
     titres_disponibles = [
         "\U0001f680 Connexion au serveur Crash...",
+        "🇷🇺 ПОДОЖДИТЕ - Veuillez patienter.",
         "\U0001f4e1 Synchronisation des données...",
         "\U0001f4ca Analyse des derniers Crash...",
         "\U0001f9e0 Calcul du multiplicateur...",
@@ -1168,7 +1251,7 @@ async def lancer_animation_analyse(query, user_id):
         "\U0001f4c8 Analyse des tendances...",
         "\U0001f50d Recherche d'une opportunité...",
     ]
-    titres = random.sample(titres_disponibles, k=len(etapes) - 1) + ["\u2705 Validation finale..."]
+    titres = random.sample(titres_disponibles, k=len(etapes) - 1) + ["\u2705 🇷🇺 СИГНАЛ ГОТОВ - Signal prêt."]
     poids = [1 / (len(etapes) - 1)] * (len(etapes) - 1)
     variations = [random.uniform(0.85, 1.15) for _ in poids]
     delais = [poids[i] * variations[i] for i in range(len(poids))]
@@ -1218,7 +1301,7 @@ def delai_signal_crash(coefficient):
     return 5
 
 def generer_signal(user=None):
-    heure_date = datetime.datetime.now()
+    heure_date = maintenant_crash()
     coefficient_number = generer_multiplicateur_pondere_crash()
     assurance = generer_assurance_crash(coefficient_number)
     minutes = delai_signal_crash(coefficient_number)
@@ -1227,6 +1310,7 @@ def generer_signal(user=None):
     message = (
         "━━━━━━━━━━━━━━━━━━\n"
         "💥 <b>CRASH AI</b>\n"
+        "🇷🇺 <b>СИГНАЛ ГОТОВ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "🎯 <b>Multiplicateur</b>\n"
         f"<code>{coefficient_number:.2f}x</code>\n\n"
@@ -1235,7 +1319,8 @@ def generer_signal(user=None):
         "🕒 <b>Heure</b>\n"
         f"<code>{formater_heure_signal(heure_date)}</code>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "✅ <b>Analyse terminée</b>\n"
+        "✅ 🇷🇺 <b>АНАЛИЗ ЗАВЕРШЁН</b>\n"
+        "Analyse terminée\n"
         "━━━━━━━━━━━━━━━━━━"
     )
     return message, True
@@ -1509,6 +1594,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texte = (
             "━━━━━━━━━━━━━━━━━━\n"
             "👑 <b>ESPACE VIP PREMIUM</b>\n"
+            "🇷🇺 <b>СИСТЕМА АКТИВНА</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n\n"
             f"📅 Début : <b>{echapper_html_texte(formater_date(vip_debut))}</b>\n"
@@ -1516,16 +1602,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Jours restants : <b>{jours_restants} jour{'s' if jours_restants > 1 else ''}</b>\n\n"
             f"{texte_compteur_compte(user)}\n\n"
             "🎰 Lance une analyse pour obtenir le prochain signal."
+            "\n🇷🇺 Сигнал будет готов après l'analyse."
         )
         markup = bouton_signal(vip=vip, illimite=True)
     else:
         texte = (
             "━━━━━━━━━━━━━━━━━━\n"
             "💥 <b>CRASH AI PREMIUM</b>\n"
+            "🇷🇺 <b>СИСТЕМА АКТИВНА</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n\n"
             f"{texte_compteur_compte(user)}\n\n"
             "💥 Appuie sur le bouton pour lancer une analyse."
+            "\n🇷🇺 Сигнал будет готов après l'analyse."
         )
         markup = bouton_signal(restants=restants, vip=vip) if restants > 0 else bouton_vip()
 
@@ -1574,46 +1663,37 @@ async def mon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def bouton_choix_limite_journaliere():
     return InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton("Avec limitation", callback_data="daily_limit_yes"),
-                InlineKeyboardButton("Sans limitation", callback_data="daily_limit_no"),
-            ]
+            [InlineKeyboardButton("❌ Non", callback_data="daily_limit_no")],
+            [InlineKeyboardButton("✅ Oui", callback_data="daily_limit_yes")],
         ]
     )
 
-def bouton_choix_date_abonnement():
+def bouton_type_client_abonnement():
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Modifier la date", callback_data="subscription_date_modify")],
-            [InlineKeyboardButton("Conserver la date actuelle", callback_data="subscription_date_keep")],
+            [InlineKeyboardButton("Nouveau client", callback_data="subscription_client_new")],
+            [InlineKeyboardButton("Ancien client", callback_data="subscription_client_old")],
+        ]
+    )
+
+def bouton_confirmation_abonnement():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Confirmer", callback_data="subscription_confirm_yes"),
+                InlineKeyboardButton("❌ Annuler", callback_data="subscription_confirm_no"),
+            ]
         ]
     )
 
 async def demander_limite_journaliere(update, code_cible, operation, nombre=None):
     details = f"\n\nSignaux : <b>{nombre}</b>" if nombre is not None else ""
     await update.message.reply_text(
-        "Gestion de la limitation quotidienne\n\n"
+        "1️⃣ <b>Limitation quotidienne ?</b>\n\n"
+        "📊 Voulez-vous appliquer une limitation quotidienne ?\n\n"
         f"Client : <code>{echapper_html_texte(code_cible)}</code>{details}",
         parse_mode=ParseMode.HTML,
         reply_markup=bouton_choix_limite_journaliere(),
-    )
-
-async def demander_date_abonnement(context, chat_id, pending):
-    code_cible = pending.get("code")
-    data = migrer_si_besoin(charger_users())
-    uid_cible = trouver_uid_par_code(data, code_cible)
-    date_actuelle = "-"
-    if uid_cible is not None and data[uid_cible].get("vip_fin"):
-        date_actuelle = formater_date(data[uid_cible].get("vip_fin"))
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "Gestion de la date d'expiration\n\n"
-            f"Client : <code>{echapper_html_texte(code_cible)}</code>\n"
-            f"Date actuelle : <b>{echapper_html_texte(date_actuelle)}</b>"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=bouton_choix_date_abonnement(),
     )
 
 async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, limite_jour=None):
@@ -1689,61 +1769,93 @@ async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, l
 
     await _envoyer_notification_groupe(context, notif)
 
-async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_jour=None, expiration=None, conserver_date=False):
+async def appliquer_abonnement_admin(context, admin_chat_id, pending):
+    code_cible = pending.get("code")
+    limite_active = bool(pending.get("limite_active", True))
+    limite_jour = entier_positif(pending.get("limite_jour", 0)) if limite_active else None
+    type_client = pending.get("type_client", "nouveau")
+    debut_ts = timestamp_ou_none(pending.get("debut_ts"))
+    fin_ts = timestamp_ou_none(pending.get("fin_ts"))
+
     data = migrer_si_besoin(charger_users())
     uid_cible = trouver_uid_par_code(data, code_cible)
     if uid_cible is None:
         await context.bot.send_message(
             chat_id=admin_chat_id,
-            text=f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.",
+            text=f"\u274c Aucun client trouve avec le code <code>{echapper_html_texte(code_cible)}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if limite_active and (not limite_jour or limite_jour <= 0):
+        await context.bot.send_message(
+            chat_id=admin_chat_id,
+            text="Abonnement annule : la limite quotidienne est obligatoire.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     maintenant = datetime.datetime.now()
-    user_cible = data[uid_cible]
-    ancienne_fin = timestamp_ou_none(user_cible.get("vip_fin"))
-    if conserver_date and ancienne_fin:
-        fin = datetime.datetime.fromtimestamp(ancienne_fin)
-    elif conserver_date:
-        await context.bot.send_message(
-            chat_id=admin_chat_id,
-            text=(
-                "Aucune date actuelle n'existe pour ce client.\n\n"
-                "Relancez <code>/abonnement CODE</code> puis choisissez <b>Modifier la date</b>."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    elif expiration is not None:
-        fin = expiration
+    if debut_ts and fin_ts:
+        debut = datetime.datetime.fromtimestamp(debut_ts)
+        fin = datetime.datetime.fromtimestamp(fin_ts)
     else:
+        debut = maintenant
         fin = maintenant + datetime.timedelta(days=30)
+        debut_ts = debut.timestamp()
+        fin_ts = fin.timestamp()
+
+    jours_restants = max(0, (fin.date() - maintenant.date()).days)
+    type_label = "Ancien client" if type_client == "ancien" else "Nouveau client"
+    user_cible = data[uid_cible]
     normaliser_signaux_gratuits(user_cible)
     user_cible["vip"] = True
     user_cible["illimite"] = True
-    if not conserver_date or not user_cible.get("vip_debut"):
-        user_cible["vip_debut"] = maintenant.timestamp()
-    user_cible["vip_fin"] = fin.timestamp()
+    user_cible["vip_debut"] = debut_ts
+    user_cible["vip_fin"] = fin_ts
     user_cible["vip_signals"] = 0
     user_cible["restants"] = None
-    configurer_limite_journaliere(user_cible, limite_jour)
+    user_cible["abonnement_type_client"] = type_client
+    user_cible["abonnement_jours_restants_activation"] = jours_restants
+    historique_abonnements = user_cible.setdefault("historique_abonnements", [])
+    historique_abonnements.append(
+        {
+            "type_client": type_client,
+            "date_debut_originale": debut.strftime("%d/%m/%Y"),
+            "date_expiration_originale": fin.strftime("%d/%m/%Y"),
+            "jours_restants_activation": jours_restants,
+            "limite_jour": limite_jour,
+            "limite_active": limite_active,
+            "enregistre_le": maintenant.isoformat(timespec="seconds"),
+        }
+    )
+    user_cible["historique_abonnements"] = historique_abonnements[-HISTORIQUE_LIMIT:]
+    configurer_limite_journaliere(user_cible, limite_jour if limite_active else None)
     sauvegarder_users(data)
 
     limite_txt = (
-        f"\n📅 Limite quotidienne : <b>{limite_jour}</b> signal{'s' if limite_jour and limite_jour > 1 else ''} / jour"
-        if limite_jour
-        else "\n📅 Limite quotidienne : <b>Non activée</b>"
+        f"\n\U0001f4ca Limite quotidienne : <b>{limite_jour}</b> signal{'s' if limite_jour > 1 else ''} / jour"
+        if limite_active
+        else "\n\U0001f4ca Limitation : <b>Aucune</b>"
+    )
+    duree_txt = "30 jours" if type_client == "nouveau" else f"{jours_restants} jours restants"
+    titre_admin = "ABONNEMENT RESTAURE" if type_client == "ancien" else "ABONNEMENT ACTIVE"
+    type_admin_txt = f"\U0001f451 Type : <b>{type_label}</b>\n" if limite_active else ""
+    texte_admin = (
+        f"\U0001f451 <b>{titre_admin}</b>\n\n"
+        f"\U0001f464 Client : <code>{echapper_html_texte(code_cible)}</code>\n"
+        f"{type_admin_txt}"
+        f"{limite_txt}\n"
+        "\U0001f3af Signaux : <b>Illimites</b>\n"
+        f"\U0001f4c5 Duree : <b>{duree_txt}</b>\n\n"
+        f"\U0001f4c5 Debut : <b>{debut.strftime('%d/%m/%Y')}</b>\n"
+        f"\U0001f4c5 Expiration : <b>{fin.strftime('%d/%m/%Y')}</b>\n"
+        f"\u23f3 Jours restants : <b>{jours_restants}</b>\n\n"
+        "\u2705 Abonnement active avec succes."
     )
     await context.bot.send_message(
         chat_id=admin_chat_id,
-        text=(
-            f"✅ Abonnement mensuel activé pour <code>{echapper_html_texte(code_cible)}</code> 👑\n\n"
-            "♾️ Signaux illimités activés immédiatement.\n"
-            f"{limite_txt}\n\n"
-            f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
-            f"📆 Fin : <b>{fin.strftime('%d/%m/%Y')}</b>"
-        ),
+        text=texte_admin,
         parse_mode=ParseMode.HTML,
     )
 
@@ -1751,11 +1863,11 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=(
-                "🎉 Ton abonnement <b>VIP</b> est activé ! 👑\n\n"
-                f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
-                f"📆 Expire le : <b>{fin.strftime('%d/%m/%Y')}</b>\n"
-                "⏳ Durée : <b>30 jours</b>\n"
-                "♾️ Signaux illimités"
+                "\U0001f389 Ton abonnement <b>VIP</b> est active ! \U0001f451\n\n"
+                f"\U0001f4c5 Debut : <b>{debut.strftime('%d/%m/%Y')}</b>\n"
+                f"\U0001f4c5 Expiration : <b>{fin.strftime('%d/%m/%Y')}</b>\n"
+                f"\u23f3 Jours restants : <b>{jours_restants}</b>\n"
+                "\u267e\ufe0f Signaux illimites"
                 f"{limite_txt}\n\n"
                 "Tape /start pour voir ton abonnement."
             ),
@@ -1771,18 +1883,19 @@ async def appliquer_abonnement_admin(context, admin_chat_id, code_cible, limite_
         admin_name = str(admin_chat_id)
 
     price_fcfa = ABONNEMENT_PRICE
-    duree_jours = max(0, jours_restants_jusqua(fin.timestamp(), maintenant=maintenant))
-    journaliser_abonnement(code_cible, admin_name, duree_jours=duree_jours or 30, price_fcfa=price_fcfa)
+    journaliser_abonnement(code_cible, admin_name, duree_jours=jours_restants, price_fcfa=price_fcfa)
 
     notif = (
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👑 <b>NOUVEL ABONNEMENT</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 Client : {echapper_html_texte(code_cible)}\n\n"
-        "📅 Durée :\n30 jours\n\n"
-        f"💵 Montant :\n{format_fcfa(price_fcfa)} FCFA\n\n"
-        f"🕒 Heure :\n{echapper_html_texte(datetime.datetime.now().strftime('%H:%M'))}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
+        "----------------------\n\n"
+        "\U0001f451 <b>NOUVEL ABONNEMENT</b>\n\n"
+        "----------------------\n\n"
+        f"\U0001f464 Client : {echapper_html_texte(code_cible)}\n\n"
+        f"Type :\n{type_label}\n\n"
+        f"Duree restante :\n{jours_restants} jours\n\n"
+        f"Limite :\n{limite_jour if limite_active else 'Aucune'}{(' signaux/jour' if limite_active else '')}\n\n"
+        f"\U0001f4b5 Montant :\n{format_fcfa(price_fcfa)} FCFA\n\n"
+        f"\U0001f552 Heure :\n{echapper_html_texte(datetime.datetime.now().strftime('%H:%M'))}\n\n"
+        "----------------------"
     )
 
     await _envoyer_notification_groupe(context, notif)
@@ -2372,18 +2485,48 @@ async def finaliser_action_limite_journaliere(context, chat_id, pending, limite_
         await appliquer_recharge_admin(context, chat_id, code_cible, int(pending.get("nombre", 0)), limite_jour)
     elif operation == "abonnement":
         pending["limite_jour"] = limite_jour
-        await demander_date_abonnement(context, chat_id, pending)
+        await demander_type_client_abonnement(context, chat_id, pending)
 
-async def finaliser_abonnement_avec_date(context, chat_id, pending, expiration=None, conserver_date=False):
-    code_cible = pending.get("code")
-    limite_jour = pending.get("limite_jour")
-    await appliquer_abonnement_admin(
-        context,
-        chat_id,
-        code_cible,
-        limite_jour=limite_jour,
-        expiration=expiration,
-        conserver_date=conserver_date,
+async def demander_type_client_abonnement(context, chat_id, pending):
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Type de client ?\n\n"
+            f"Client : <code>{echapper_html_texte(pending.get('code'))}</code>\n"
+            f"Limite : <b>{pending.get('limite_jour')}</b> signaux/jour"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_type_client_abonnement(),
+    )
+
+def parser_date_abonnement_debut(texte):
+    try:
+        date_debut = datetime.datetime.strptime((texte or "").strip(), "%d/%m/%Y")
+    except ValueError:
+        return None
+    return date_debut.replace(hour=0, minute=0, second=0, microsecond=0)
+
+def texte_confirmation_abonnement(pending):
+    debut = datetime.datetime.fromtimestamp(timestamp_ou_none(pending.get("debut_ts")))
+    fin = datetime.datetime.fromtimestamp(timestamp_ou_none(pending.get("fin_ts")))
+    jours_restants = max(0, (fin.date() - datetime.datetime.now().date()).days)
+    type_label = "Ancien client" if pending.get("type_client") == "ancien" else "Nouveau client"
+    return (
+        f"\U0001f464 Client : <code>{echapper_html_texte(pending.get('code'))}</code>\n\n"
+        f"\U0001f451 Type : <b>{type_label}</b>\n\n"
+        f"\U0001f4c5 Debut : <b>{debut.strftime('%d/%m/%Y')}</b>\n\n"
+        f"\U0001f4c5 Expiration : <b>{fin.strftime('%d/%m/%Y')}</b>\n\n"
+        f"\u23f3 Jours restants : <b>{jours_restants}</b>\n\n"
+        f"\U0001f4ca Limite : <b>{pending.get('limite_jour')}</b> signaux/jour\n\n"
+        "Confirmer ?"
+    )
+
+async def demander_confirmation_abonnement(context, chat_id, pending):
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=texte_confirmation_abonnement(pending),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_confirmation_abonnement(),
     )
 
 @handler_securise
@@ -2400,9 +2543,26 @@ async def choix_limite_journaliere_callback(update: Update, context: ContextType
         return
 
     if query.data == "daily_limit_no":
+        context.user_data.pop("daily_limit_pending", None)
+        if pending.get("operation") == "abonnement":
+            maintenant = datetime.datetime.now()
+            fin = maintenant + datetime.timedelta(days=30)
+            pending.update(
+                {
+                    "limite_active": False,
+                    "limite_jour": None,
+                    "type_client": "nouveau",
+                    "debut_ts": maintenant.timestamp(),
+                    "fin_ts": fin.timestamp(),
+                }
+            )
+            await query.edit_message_text(
+                "Limitation quotidienne desactivee. Activation de l'abonnement en cours...",
+                parse_mode=ParseMode.HTML,
+            )
+            await appliquer_abonnement_admin(context, query.message.chat_id, pending)
+            return
         await query.edit_message_text("Limitation quotidienne desactivee. Application en cours...", parse_mode=ParseMode.HTML)
-        if pending.get("operation") != "abonnement":
-            context.user_data.pop("daily_limit_pending", None)
         await finaliser_action_limite_journaliere(context, query.message.chat_id, pending, limite_jour=None)
         return
 
@@ -2414,7 +2574,7 @@ async def choix_limite_journaliere_callback(update: Update, context: ContextType
     )
 
 @handler_securise
-async def choix_date_abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choix_type_client_abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
         await refuser_non_admin(update)
         return
@@ -2426,18 +2586,53 @@ async def choix_date_abonnement_callback(update: Update, context: ContextTypes.D
         await query.edit_message_text("Aucun abonnement en attente.", parse_mode=ParseMode.HTML)
         return
 
-    if query.data == "subscription_date_keep":
-        context.user_data.pop("daily_limit_pending", None)
-        await query.edit_message_text("Date actuelle conservee. Application en cours...", parse_mode=ParseMode.HTML)
-        await finaliser_abonnement_avec_date(context, query.message.chat_id, pending, conserver_date=True)
+    if query.data == "subscription_client_new":
+        maintenant = datetime.datetime.now()
+        fin = maintenant + datetime.timedelta(days=30)
+        pending["type_client"] = "nouveau"
+        pending["debut_ts"] = maintenant.timestamp()
+        pending["fin_ts"] = fin.timestamp()
+        context.user_data["daily_limit_pending"] = pending
+        await query.edit_message_text(
+            "Nouveau client selectionne. Verification finale...",
+            parse_mode=ParseMode.HTML,
+        )
+        await demander_confirmation_abonnement(context, query.message.chat_id, pending)
         return
 
-    context.user_data["subscription_date_waiting"] = True
+    pending["type_client"] = "ancien"
+    context.user_data["daily_limit_pending"] = pending
+    context.user_data["subscription_old_start_waiting"] = True
     await query.edit_message_text(
-        "Envoyez la nouvelle date d'expiration au format <code>JJ/MM/AAAA</code>.\n\n"
-        "Exemple : <code>25/08/2026</code>",
+        "Envoyez la date de debut de l'ancien abonnement au format <code>JJ/MM/AAAA</code>.\n\n"
+        "Exemple : <code>01/08/2026</code>",
         parse_mode=ParseMode.HTML,
     )
+
+@handler_securise
+async def confirmation_abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    pending = context.user_data.get("daily_limit_pending")
+    context.user_data.pop("subscription_old_start_waiting", None)
+    context.user_data.pop("subscription_old_end_waiting", None)
+
+    if not pending or pending.get("operation") != "abonnement":
+        await query.edit_message_text("Aucun abonnement en attente.", parse_mode=ParseMode.HTML)
+        return
+
+    if query.data == "subscription_confirm_no":
+        context.user_data.pop("daily_limit_pending", None)
+        await query.edit_message_text("Abonnement annule. Aucune donnee enregistree.", parse_mode=ParseMode.HTML)
+        return
+
+    context.user_data.pop("daily_limit_pending", None)
+    await query.edit_message_text("Confirmation recue. Enregistrement en cours...", parse_mode=ParseMode.HTML)
+    await appliquer_abonnement_admin(context, query.message.chat_id, pending)
 
 @handler_securise
 async def limite_journaliere_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2470,29 +2665,59 @@ async def limite_journaliere_message(update: Update, context: ContextTypes.DEFAU
 
 @handler_securise
 async def date_abonnement_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("subscription_date_waiting"):
+    waiting_start = context.user_data.get("subscription_old_start_waiting")
+    waiting_end = context.user_data.get("subscription_old_end_waiting")
+    if not waiting_start and not waiting_end:
         return False
     if not est_admin(update):
         await refuser_non_admin(update)
+        return True
+
+    pending = context.user_data.get("daily_limit_pending")
+    if not pending or pending.get("operation") != "abonnement":
+        context.user_data.pop("subscription_old_start_waiting", None)
+        context.user_data.pop("subscription_old_end_waiting", None)
+        await update.message.reply_text("Aucun abonnement en attente.", parse_mode=ParseMode.HTML)
+        return True
+
+    if waiting_start:
+        debut = parser_date_abonnement_debut(update.message.text)
+        if debut is None:
+            await update.message.reply_text(
+                "Date invalide. Envoyez une date au format <code>JJ/MM/AAAA</code>.\n\n"
+                "Exemple : <code>01/08/2026</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        pending["debut_ts"] = debut.timestamp()
+        context.user_data["daily_limit_pending"] = pending
+        context.user_data.pop("subscription_old_start_waiting", None)
+        context.user_data["subscription_old_end_waiting"] = True
+        await update.message.reply_text(
+            "Envoyez la date d'expiration de l'ancien abonnement au format <code>JJ/MM/AAAA</code>.\n\n"
+            "Exemple : <code>05/09/2026</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return True
 
     expiration = parser_date_expiration(update.message.text)
     if expiration is None:
         await update.message.reply_text(
             "Date invalide. Envoyez une date au format <code>JJ/MM/AAAA</code>.\n\n"
-            "Exemple : <code>25/08/2026</code>",
+            "Exemple : <code>05/09/2026</code>",
             parse_mode=ParseMode.HTML,
         )
         return True
 
-    pending = context.user_data.get("daily_limit_pending")
-    context.user_data.pop("daily_limit_pending", None)
-    context.user_data.pop("subscription_date_waiting", None)
-    if not pending or pending.get("operation") != "abonnement":
-        await update.message.reply_text("Aucun abonnement en attente.", parse_mode=ParseMode.HTML)
+    context.user_data.pop("subscription_old_end_waiting", None)
+    if timestamp_ou_none(pending.get("debut_ts")) is None:
+        await update.message.reply_text("Date de debut manquante. Relancez <code>/abonnement CODE</code>.", parse_mode=ParseMode.HTML)
+        context.user_data.pop("daily_limit_pending", None)
         return True
 
-    await finaliser_abonnement_avec_date(context, update.effective_chat.id, pending, expiration=expiration)
+    pending["fin_ts"] = expiration.timestamp()
+    context.user_data["daily_limit_pending"] = pending
+    await demander_confirmation_abonnement(context, update.effective_chat.id, pending)
     return True
 
 @handler_securise
@@ -2640,6 +2865,20 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
+        etat_planning = planning_crash()
+        if not etat_planning["actif"]:
+            msg = await remplacer_message(
+                query,
+                texte_mise_a_jour_crash(etat_planning),
+                bouton_signal(
+                    restants=user.get("restants"),
+                    vip=user.get("vip", False),
+                    illimite=abonnement_actif(user),
+                ),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
         attente = get_secondes_restantes(user)
         if attente > 0:
             msg = await remplacer_message(
@@ -2701,6 +2940,20 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query,
                 texte_expiration(user),
                 bouton_vip() if user.get("restants", 0) <= 0 else bouton_signal(restants=user.get("restants", 0)),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        etat_planning = planning_crash()
+        if not etat_planning["actif"]:
+            msg = await remplacer_message(
+                query,
+                texte_mise_a_jour_crash(etat_planning),
+                bouton_signal(
+                    restants=user.get("restants"),
+                    vip=user.get("vip", False),
+                    illimite=abonnement_actif(user),
+                ),
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
@@ -3151,7 +3404,8 @@ def creer_application():
     
     # Handlers de callback - Menu principal
     app.add_handler(CallbackQueryHandler(choix_limite_journaliere_callback, pattern="^daily_limit_(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(choix_date_abonnement_callback, pattern="^subscription_date_(modify|keep)$"))
+    app.add_handler(CallbackQueryHandler(choix_type_client_abonnement_callback, pattern="^subscription_client_(new|old)$"))
+    app.add_handler(CallbackQueryHandler(confirmation_abonnement_callback, pattern="^subscription_confirm_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
     app.add_handler(CallbackQueryHandler(compte_menu_callback, pattern="^compte_menu$"))
     app.add_handler(CallbackQueryHandler(vip_menu_callback, pattern="^vip_menu$"))
