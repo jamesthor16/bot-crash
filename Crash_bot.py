@@ -1276,36 +1276,37 @@ async def lancer_animation_analyse(query, user_id):
     return message
 
 def generer_multiplicateur_pondere_crash():
-    """Distribution : 1.50–2.00x (45%) | 2.00–2.50x (30%) | 2.50–3.50x (17%) | 3.50–5.00x (8%)"""
-    plages = [
-        (1.50, 2.00, 0.45),
-        (2.00, 2.50, 0.30),
-        (2.50, 3.50, 0.17),
-        (3.50, 5.00, 0.08),
-    ]
-    poids = [p[2] for p in plages]
-    plage_index = random.choices(range(len(plages)), weights=poids, k=1)[0]
-    low, high, _ = plages[plage_index]
-    return round(random.uniform(low, high), 2)
+    """Logique CRASH AI originale : multiplicateur entre 2.00x et 3.50x."""
+    return round(random.uniform(2.00, 3.50), 2)
 
-def generer_assurance_crash(coefficient):
-    """Assurance 1.50–4.00x, jamais > coefficient"""
-    return round(random.uniform(1.50, min(4.00, coefficient)), 2)
+def generer_assurance_crash(coefficient=None):
+    """Logique CRASH AI originale : assurance indépendante entre 1.50x et 2.50x."""
+    return round(random.uniform(1.50, 2.50), 2)
 
 def delai_signal_crash(coefficient):
-    """2–5 min selon coefficient"""
+    """Délai original déterminé uniquement depuis le multiplicateur."""
     c = float(coefficient) if isinstance(coefficient, (int, float)) else 0
-    if c >= 4.00: return 2
-    if c >= 3.00: return 3
-    if c >= 2.00: return 4
-    return 5
+    if c >= 3.10:
+        return 4
+    if c >= 2.70:
+        return 5
+    if c >= 2.30:
+        return 6
+    return 7
 
 def generer_signal(user=None):
     heure_date = maintenant_crash()
     coefficient_number = generer_multiplicateur_pondere_crash()
+    deja_vus = {f"{float(valeur):.2f}" for valeur in derniers_multiplicateurs(user or {})}
+    for _ in range(12):
+        if f"{coefficient_number:.2f}" not in deja_vus:
+            break
+        coefficient_number = generer_multiplicateur_pondere_crash()
+
     assurance = generer_assurance_crash(coefficient_number)
     minutes = delai_signal_crash(coefficient_number)
     heure_date = heure_date + datetime.timedelta(minutes=minutes)
+    memoriser_signal_interne(coefficient_number)
 
     message = (
         "━━━━━━━━━━━━━━━━━━\n"
