@@ -121,23 +121,35 @@ def get_db_pool():
             logger.error("CRASH cannot start without PostgreSQL")
             raise PostgreSQLObligatoireError("DATABASE_URL est obligatoire pour demarrer CRASH.")
         try:
+            PsycopgConnect = importlib.import_module("psycopg").connect
             PsycopgConnectionPool = importlib.import_module("psycopg_pool").ConnectionPool
             PsycopgJsonb = importlib.import_module("psycopg.types.json").Jsonb
             Jsonb = PsycopgJsonb
             schema = schema_postgres()
+            connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+            with PsycopgConnect(
+                database_url,
+                options=f"-c search_path={schema}",
+                connect_timeout=connect_timeout,
+            ) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+
             db_pool = PsycopgConnectionPool(
                 database_url,
                 min_size=1,
                 max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")),
-                kwargs={"options": f"-c search_path={schema}"},
+                kwargs={"options": f"-c search_path={schema}", "connect_timeout": connect_timeout},
             )
-            with db_pool.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
             logger.info("PostgreSQL connection: OK")
         except Exception as exc:
             logger.error("PostgreSQL connection: FAILED")
+            if "postgres.railway.internal" in database_url:
+                logger.error(
+                    "DATABASE_URL utilise postgres.railway.internal: cette adresse ne fonctionne que "
+                    "si le bot et PostgreSQL sont dans le meme projet Railway avec le reseau prive actif."
+                )
             logger.error("CRASH cannot start without PostgreSQL")
             if db_pool is not None:
                 try:
@@ -3384,3 +3396,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# fin
