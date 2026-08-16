@@ -12,6 +12,7 @@ import string
 import threading
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from json import JSONDecodeError
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -78,14 +79,13 @@ storage_lock = threading.RLock()
 storage_cache = {}
 db_pool = None
 db_initialized = False
+db_disabled = False
+db_warning_logged = False
 Jsonb = None
 analyses_lock = threading.Lock()
 analyses_en_cours = set()
 signal_history_lock = threading.Lock()
 derniers_signaux_generes = []
-
-class PostgreSQLObligatoireError(RuntimeError):
-    pass
 
 def identifiant_sql_sur(schema):
     if not SAFE_DB_IDENTIFIER_RE.match(schema or ""):
@@ -102,24 +102,70 @@ def copie_defaut(default):
         return list(default)
     return default
 
+def chemins_migration_json(*noms):
+    chemins = []
+    for nom in noms:
+        if nom and nom not in chemins:
+            chemins.append(nom)
+    return chemins
+
+def lire_json_migration(path, default):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return copie_defaut(default)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (JSONDecodeError, OSError) as exc:
+        logger.exception("Impossible d'importer %s vers PostgreSQL.", path, exc_info=exc)
+        return copie_defaut(default)
+
 def lire_json_fichier(path, default):
-    raise PostgreSQLObligatoireError(
-        f"PostgreSQL est obligatoire pour CRASH: lecture locale interdite ({path})."
-    )
+    with storage_lock:
+        if path in storage_cache:
+            return storage_cache[path]
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            valeur = copie_defaut(default)
+            storage_cache[path] = valeur
+            return valeur
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                valeur = json.load(f)
+                storage_cache[path] = valeur
+                return valeur
+        except (JSONDecodeError, OSError) as exc:
+            logger.exception("Impossible de lire %s. Valeur par défaut utilisée.", path, exc_info=exc)
+            valeur = copie_defaut(default)
+            storage_cache[path] = valeur
+            return valeur
 
 def ecrire_json_fichier(path, data):
-    raise PostgreSQLObligatoireError(
-        f"PostgreSQL est obligatoire pour CRASH: ecriture locale interdite ({path})."
-    )
+    dossier = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(dossier, exist_ok=True)
+    tmp_path = os.path.join(dossier, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    with storage_lock:
+        storage_cache[path] = data
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+
+def avertir_stockage_json(message):
+    global db_warning_logged
+    if not db_warning_logged:
+        logger.warning("%s Utilisation du stockage JSON.", message)
+        db_warning_logged = True
 
 def get_db_pool():
-    global db_pool, Jsonb
+    global db_pool, db_disabled, Jsonb
+    if db_disabled:
+        return None
     if db_pool is None:
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
-            logger.error("PostgreSQL connection: FAILED")
-            logger.error("CRASH cannot start without PostgreSQL")
-            raise PostgreSQLObligatoireError("DATABASE_URL est obligatoire pour demarrer CRASH.")
+            avertir_stockage_json("DATABASE_URL absente.")
+            db_disabled = True
+            return None
         try:
             PsycopgConnectionPool = importlib.import_module("psycopg_pool").ConnectionPool
             PsycopgJsonb = importlib.import_module("psycopg.types.json").Jsonb
@@ -131,66 +177,31 @@ def get_db_pool():
                 max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")),
                 kwargs={"options": f"-c search_path={schema}"},
             )
-            with db_pool.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-            logger.info("PostgreSQL connection: OK")
         except Exception as exc:
-            logger.error("PostgreSQL connection: FAILED")
-            logger.error("CRASH cannot start without PostgreSQL")
-            if db_pool is not None:
-                try:
-                    db_pool.close()
-                except Exception:
-                    pass
-                db_pool = None
-            raise PostgreSQLObligatoireError("PostgreSQL indisponible ou configuration incorrecte.") from exc
+            logger.warning("PostgreSQL indisponible (%s). Utilisation du stockage JSON.", exc)
+            db_disabled = True
+            return None
     return db_pool
-
-def verifier_schema_postgres(cur):
-    tables_attendues = {
-        "users": {"user_key", "telegram_id", "username", "code_client", "data", "updated_at"},
-        "statistiques": {"key", "data", "updated_at"},
-        "administrateurs": {"key", "data", "updated_at"},
-    }
-    for table, colonnes_attendues in tables_attendues.items():
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = %s
-            """,
-            (table,),
-        )
-        colonnes = {ligne[0] for ligne in cur.fetchall()}
-        manquantes = colonnes_attendues - colonnes
-        if manquantes:
-            raise PostgreSQLObligatoireError(
-                f"Schema PostgreSQL incorrect: table {table}, colonnes manquantes: {', '.join(sorted(manquantes))}."
-            )
-
-    cur.execute("SELECT COUNT(*) FROM users")
-    cur.fetchone()
-    cur.execute("SELECT COUNT(*) FROM statistiques")
-    cur.fetchone()
-    cur.execute("SELECT COUNT(*) FROM administrateurs")
-    cur.fetchone()
 
 def initialiser_base_de_donnees():
     """
-    Initialise PostgreSQL. Aucun stockage local n'est autorise pour CRASH.
+    Initialise la base et effectue une migration minimale :
+    - crée les tables si besoin
+    - migre le JSON vers Postgres si tables vides
+    - génère des codes pour les utilisateurs existants qui n'en ont pas (SEULEMENT si Postgres disponible)
     """
-    global db_initialized
+    global db_initialized, db_disabled
     if db_initialized:
-        return True
+        return not db_disabled
 
     with storage_lock:
         if db_initialized:
-            return True
+            return not db_disabled
 
         pool = get_db_pool()
+        if pool is None:
+            db_initialized = True
+            return False
         try:
             with pool.connection() as conn:
                 with conn.cursor() as cur:
@@ -229,40 +240,34 @@ def initialiser_base_de_donnees():
                     )
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users (telegram_id)")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_code_client ON users (code_client)")
-                    verifier_schema_postgres(cur)
                 conn.commit()
 
-            importer_tables_publiques_si_presentes()
+            migrer_json_vers_postgres_si_vide()
 
-            # Synchronise les anciens comptes PostgreSQL qui n'ont pas encore de code client.
+            # Après avoir un pool valide et les utilisateurs chargés, s'assurer que chaque user a un 'code'
+            # et que la colonne code_client est synchronisée => utilité pour la nouvelle logique d'invitations.
             try:
-                with pool.connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT user_key, data FROM users")
-                        data = {str(user_key): data for user_key, data in cur.fetchall()}
-                        modifie = False
-                        for uid, user in data.items():
-                            if not isinstance(user, dict):
-                                continue
-                            if "code" not in user or not user.get("code"):
-                                user["code"] = generer_code_unique(data)
-                                modifie = True
-                        if modifie:
-                            sauvegarder_users_postgres(cur, data)
-                    conn.commit()
+                data = lire_json(DATA_FILE, {})
+                modifie = False
+                for uid, user in data.items():
+                    if not isinstance(user, dict):
+                        continue
+                    if "code" not in user or not user.get("code"):
+                        user["code"] = generer_code_unique(data)
+                        modifie = True
+                if modifie:
+                    sauvegarder_users(data)
             except Exception:
                 logger.exception("Impossible d'assigner automatiquement des codes aux comptes existants.")
-                raise
         except Exception as exc:
-            logger.error("Database schema: FAILED")
-            logger.error("CRASH cannot start without PostgreSQL")
-            raise PostgreSQLObligatoireError("PostgreSQL indisponible/configuration incorrecte.") from exc
+            logger.warning("Connexion PostgreSQL impossible (%s). Utilisation du stockage JSON.", exc)
+            db_disabled = True
+            db_initialized = True
+            return False
         db_initialized = True
-        logger.info("Database schema: OK")
-        logger.info("CRASH database initialized")
         return True
 
-def importer_tables_publiques_si_presentes():
+def migrer_json_vers_postgres_si_vide():
     pool = get_db_pool()
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -283,7 +288,14 @@ def importer_tables_publiques_si_presentes():
                     cur.execute("SELECT COUNT(*) FROM users")
                     users_vide = cur.fetchone()[0] == 0
             if users_vide:
-                logger.info("Aucun utilisateur trouve dans PostgreSQL pour le schema CRASH.")
+                users_importes = {}
+                for path in chemins_migration_json(DATA_FILE, "crash_users.json"):
+                    donnees = lire_json_migration(path, {})
+                    if isinstance(donnees, dict):
+                        users_importes.update(donnees)
+                if users_importes:
+                    sauvegarder_users_postgres(cur, users_importes, supprimer_absents=False)
+                    logger.info("%s utilisateur(s) importes depuis JSON vers PostgreSQL.", len(users_importes))
 
             cur.execute("SELECT COUNT(*) FROM administrateurs")
             admins_vide = cur.fetchone()[0] == 0
@@ -302,7 +314,21 @@ def importer_tables_publiques_si_presentes():
                     cur.execute("SELECT COUNT(*) FROM administrateurs")
                     admins_vide = cur.fetchone()[0] == 0
             if admins_vide:
-                logger.info("Aucun administrateur trouve dans PostgreSQL pour le schema CRASH.")
+                admin_data = {}
+                for path in chemins_migration_json(ADMIN_ID_FILE, "crash_admin_id.json"):
+                    donnees = lire_json_migration(path, {})
+                    if isinstance(donnees, dict) and donnees:
+                        admin_data = donnees
+                        break
+                if admin_data:
+                    cur.execute(
+                        """
+                        INSERT INTO administrateurs (key, data, updated_at)
+                        VALUES ('main', %s, NOW())
+                        ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
+                        """,
+                        (Jsonb(admin_data),),
+                    )
 
             cur.execute("SELECT COUNT(*) FROM statistiques")
             stats_vides = cur.fetchone()[0] == 0
@@ -321,7 +347,26 @@ def importer_tables_publiques_si_presentes():
                     cur.execute("SELECT COUNT(*) FROM statistiques")
                     stats_vides = cur.fetchone()[0] == 0
             if stats_vides:
-                logger.info("Aucune statistique trouvee dans PostgreSQL pour le schema CRASH.")
+                data_stats = lire_json_migration("data.json", {})
+                journal = lire_json_migration(SECURITY_LOG_FILE, [])
+                if isinstance(data_stats, dict) and data_stats:
+                    cur.execute(
+                        """
+                        INSERT INTO statistiques (key, data, updated_at)
+                        VALUES ('main', %s, NOW())
+                        ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
+                        """,
+                        (Jsonb(data_stats),),
+                    )
+                if isinstance(journal, list) and journal:
+                    cur.execute(
+                        """
+                        INSERT INTO statistiques (key, data, updated_at)
+                        VALUES ('security_log', %s, NOW())
+                        ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
+                        """,
+                        (Jsonb(journal[-1000:]),),
+                    )
         conn.commit()
 
 def valeur_texte(data, *cles):
@@ -342,10 +387,12 @@ def valeur_entier(data, *cles):
     return None
 
 def sauvegarder_users_postgres(cur, data, supprimer_absents=False):
+    cles = []
     for uid, user in data.items():
         if not isinstance(user, dict):
             continue
         user_key = str(uid)
+        cles.append(user_key)
         cur.execute(
             """
             INSERT INTO users (user_key, telegram_id, username, code_client, data, updated_at)
@@ -366,8 +413,15 @@ def sauvegarder_users_postgres(cur, data, supprimer_absents=False):
             ),
         )
 
+    if supprimer_absents:
+        if cles:
+            cur.execute("DELETE FROM users WHERE NOT (user_key = ANY(%s))", (cles,))
+        else:
+            cur.execute("DELETE FROM users")
+
 def lire_json(path, default):
-    initialiser_base_de_donnees()
+    if not initialiser_base_de_donnees():
+        return lire_json_fichier(path, default)
     with storage_lock:
         if path in storage_cache:
             return storage_cache[path]
@@ -399,8 +453,11 @@ def lire_json(path, default):
         return valeur
 
 def ecrire_json(path, data):
-    initialiser_base_de_donnees()
+    if not initialiser_base_de_donnees():
+        ecrire_json_fichier(path, data)
+        return
     with storage_lock:
+        storage_cache[path] = data
         pool = get_db_pool()
         with pool.connection() as conn:
             with conn.cursor() as cur:
@@ -443,7 +500,6 @@ def ecrire_json(path, data):
                         (path, Jsonb(data)),
                     )
             conn.commit()
-        storage_cache[path] = data
 
 def get_admin_id():
     return lire_json(ADMIN_ID_FILE, {}).get("id")
@@ -458,12 +514,28 @@ def sauvegarder_users(data):
     ecrire_json(DATA_FILE, data)
 
 def safe_sauvegarder_users(data):
+    """
+    Tente de sauvegarder via la voie normale (Postgres si dispo).
+    En cas d'erreur, force la sauvegarde sur fichier JSON local et met à jour le cache.
+    Ceci garantit que la création/association marche même si Postgres est down.
+    """
     try:
+        # sauvegarder_users utilise ecrire_json qui bascule en JSON si Postgres indisponible,
+        # mais cette opération peut encore lever une exception dans certains cas -> on capture.
         sauvegarder_users(data)
         return True
     except Exception as exc:
-        logger.exception("Sauvegarde PostgreSQL obligatoire echouee. CRASH s'arrete sans stockage local.", exc_info=exc)
-        return False
+        logger.exception("Erreur en sauvegardant via la voie normale, bascule vers fichier JSON local.", exc_info=exc)
+        try:
+            # Forcer écriture sur fichier local (atomic)
+            ecrire_json_fichier(DATA_FILE, data)
+            with storage_lock:
+                storage_cache[DATA_FILE] = data
+            logger.info("Sauvegarde locale (JSON) réussie.")
+            return True
+        except Exception as exc2:
+            logger.exception("Echec de la sauvegarde locale JSON.", exc_info=exc2)
+            return False
 
 def charger_journal_securite():
     journal = lire_json(SECURITY_LOG_FILE, [])
@@ -1833,7 +1905,7 @@ async def appliquer_abonnement_admin(context, admin_chat_id, pending):
 @handler_securise
 async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Génère automatiquement un client (code + enregistrement PostgreSQL) et renvoie le lien d'invitation.
+    Génère automatiquement un client (code + enregistrement DB ou JSON fallback) et renvoie le lien d'invitation.
     """
     if not est_admin(update):
         await refuser_non_admin(update)
@@ -3365,22 +3437,16 @@ def creer_application():
     return app
 
 def main():
-    try:
-        initialiser_base_de_donnees()
-        logger.info("Bot starting...")
-        threading.Thread(target=lancer_serveur, daemon=True).start()
-        app = creer_application()
-        logger.info("Bot démarré.")
-        app.run_polling(
-            poll_interval=1.0,
-            timeout=30,
-            bootstrap_retries=-1,
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
-    except PostgreSQLObligatoireError:
-        logger.error("Bot stopped")
-        raise
+    threading.Thread(target=lancer_serveur, daemon=True).start()
+    app = creer_application()
+    logger.info("Bot démarré.")
+    app.run_polling(
+        poll_interval=1.0,
+        timeout=30,
+        bootstrap_retries=-1,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 if __name__ == "__main__":
     main()
