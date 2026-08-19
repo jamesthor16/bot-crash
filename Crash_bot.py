@@ -43,6 +43,7 @@ OPPORTUNITE_REFUS_PROBABILITY = 0.07
 SAFE_DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 POSTGRES_SCHEMA = os.getenv("CRASH_DB_SCHEMA", "crash")
 CRASH_TIMEZONE = os.getenv("CRASH_TIMEZONE", "Africa/Abidjan")
+SUBSCRIPTION_REMINDER_DAYS = (7, 3, 1)
 
 # Configuration du groupe de journalisation (0 = désactivé)
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))  # mettre -100... dans l'env pour activer
@@ -463,6 +464,20 @@ def get_admin_id():
 def sauvegarder_admin_id(user_id):
     ecrire_json(ADMIN_ID_FILE, {"id": user_id})
 
+def est_admin_user(user):
+    if not user:
+        return False
+
+    admin_id = get_admin_id()
+    if admin_id:
+        try:
+            return int(user.id) == int(admin_id)
+        except (TypeError, ValueError):
+            return False
+
+    username = (getattr(user, "username", None) or "").lstrip("@")
+    return bool(username) and username == ADMIN_USERNAME
+
 def charger_users():
     return lire_json(DATA_FILE, {})
 
@@ -661,6 +676,12 @@ def timestamp_ou_none(valeur):
     except (TypeError, ValueError):
         return None
 
+def date_depuis_timestamp(ts):
+    ts = timestamp_ou_none(ts)
+    if ts is None:
+        return None
+    return datetime.datetime.fromtimestamp(ts)
+
 def abonnement_actif(user, maintenant=None):
     if not user.get("vip"):
         return False
@@ -792,12 +813,172 @@ def remettre_en_mode_gratuit(user):
     user.pop("vip_fin", None)
     return gratuits
 
+def suspendre_abonnement_expire(user, maintenant=None):
+    maintenant = maintenant or datetime.datetime.now()
+    gratuits = normaliser_signaux_gratuits(user)
+    user["vip"] = False
+    user["illimite"] = False
+    user["restants"] = gratuits
+    user["vip_signals"] = 0
+    user["abonnement_expire"] = True
+    user["abonnement_expire_at"] = maintenant.isoformat()
+    supprimer_limite_journaliere(user)
+    return gratuits
+
 def appliquer_expiration_si_necessaire(user, maintenant=None):
     if not abonnement_expire(user, maintenant=maintenant):
         return False
 
-    remettre_en_mode_gratuit(user)
+    suspendre_abonnement_expire(user, maintenant=maintenant)
     return True
+
+def rappels_abonnement(user):
+    rappels = user.get("subscription_reminders")
+    if not isinstance(rappels, list):
+        rappels = []
+        user["subscription_reminders"] = rappels
+    return rappels
+
+def rappel_abonnement_deja_envoye(user, type_rappel):
+    type_rappel = str(type_rappel)
+    return any(isinstance(r, dict) and str(r.get("type")) == type_rappel for r in rappels_abonnement(user))
+
+def enregistrer_rappel_abonnement(user, type_rappel, maintenant=None):
+    maintenant = maintenant or datetime.datetime.now()
+    rappels = rappels_abonnement(user)
+    rappels.append(
+        {
+            "type": str(type_rappel),
+            "date_envoi": maintenant.isoformat(),
+        }
+    )
+    user["subscription_reminders"] = rappels[-HISTORIQUE_LIMIT:]
+
+def chat_id_client(uid, user):
+    telegram_id = user.get("telegram_id") if isinstance(user, dict) else None
+    if telegram_id:
+        try:
+            return int(telegram_id)
+        except (TypeError, ValueError):
+            pass
+    if str(uid).isdigit():
+        return int(uid)
+    return None
+
+def client_archive(user):
+    return bool(isinstance(user, dict) and user.get("deleted"))
+
+def choisir_rappel_abonnement(user, jours_restants):
+    if jours_restants < 0:
+        return None
+
+    for seuil in sorted(SUBSCRIPTION_REMINDER_DAYS):
+        if jours_restants <= seuil and not rappel_abonnement_deja_envoye(user, seuil):
+            return seuil
+    return None
+
+def texte_rappel_abonnement(user, jours_restants, seuil):
+    date_fin = formater_date(user.get("vip_fin"))
+    contact = admin_username_html()
+
+    if seuil == 1:
+        return (
+            "🚨 <b>DERNIER RAPPEL</b>\n\n"
+            "Votre abonnement expire demain.\n\n"
+            "👑 Accès Crash Premium\n\n"
+            f"📅 Expiration :\n<b>{echapper_html_texte(date_fin)}</b>\n\n"
+            "Après cette date, l'accès aux signaux sera suspendu.\n\n"
+            f"Contactez l'administrateur pour renouveler : {contact}"
+        )
+
+    if seuil == 3:
+        return (
+            "⚠️ <b>ABONNEMENT BIENTÔT TERMINÉ</b>\n\n"
+            "Votre abonnement Crash expire dans :\n\n"
+            f"⏳ <b>{jours_restants}</b> jour{'s' if jours_restants > 1 else ''}\n\n"
+            f"📅 Expiration :\n<b>{echapper_html_texte(date_fin)}</b>\n\n"
+            "Renouvelez votre accès pour continuer à recevoir les signaux.\n\n"
+            f"📞 Contact :\n{contact}"
+        )
+
+    return (
+        "👑 <b>ABONNEMENT CRASH</b>\n\n"
+        "🇷🇺 <b>ПРЕДУПРЕЖДЕНИЕ</b>\n\n"
+        "Bonjour,\n\n"
+        "Votre abonnement arrive bientôt à expiration.\n\n"
+        f"📅 Date d'expiration :\n<b>{echapper_html_texte(date_fin)}</b>\n\n"
+        f"⏳ Temps restant :\n<b>{jours_restants}</b> jour{'s' if jours_restants > 1 else ''}\n\n"
+        "Pour continuer à profiter des signaux Crash, contactez l'administrateur pour renouveler votre accès.\n\n"
+        f"📞 Contact :\n{contact}"
+    )
+
+def texte_alerte_admin_abonnement(code, jours_restants, date_fin):
+    if jours_restants <= 0:
+        expiration = "Aujourd'hui"
+    elif jours_restants == 1:
+        expiration = "Demain"
+    else:
+        expiration = f"Dans {jours_restants} jours"
+
+    return (
+        "⚠️ <b>ALERTE ABONNEMENT</b>\n\n"
+        f"Client :\n<code>{echapper_html_texte(code)}</code>\n\n"
+        f"Expiration :\n<b>{echapper_html_texte(expiration)}</b>\n\n"
+        f"Date :\n<b>{echapper_html_texte(date_fin)}</b>\n\n"
+        "Pensez à contacter le client."
+    )
+
+def collecter_abonnements_a_surveiller(data, maintenant=None):
+    maintenant = maintenant or datetime.datetime.now()
+    lignes = []
+    actifs = 0
+    cette_semaine = 0
+    expires = 0
+
+    for user in data.values():
+        if not isinstance(user, dict) or not user.get("vip_fin"):
+            continue
+
+        fin = date_depuis_timestamp(user.get("vip_fin"))
+        if not fin:
+            continue
+
+        code = user.get("code", "?")
+        jours = jours_restants_jusqua(user.get("vip_fin"), maintenant=maintenant)
+        if abonnement_actif(user, maintenant=maintenant):
+            actifs += 1
+            if 0 <= jours <= 7:
+                cette_semaine += 1
+                if jours <= 0:
+                    statut = "Expire aujourd'hui"
+                elif jours == 1:
+                    statut = "Expire demain"
+                else:
+                    statut = f"Expire dans {jours} jours"
+                lignes.append((jours, code, statut))
+        else:
+            expires += 1
+            lignes.append((-1, code, "Expiré"))
+
+    lignes.sort(key=lambda item: (item[0] < 0, item[0], item[1]))
+    return actifs, cette_semaine, expires, lignes
+
+def texte_abonnements_a_surveiller(data, maintenant=None):
+    actifs, cette_semaine, expires, lignes = collecter_abonnements_a_surveiller(data, maintenant=maintenant)
+    texte = (
+        "👑 <b>ABONNEMENTS</b>\n\n"
+        f"Actifs :\n<b>{actifs}</b>\n\n"
+        f"Expire cette semaine :\n<b>{cette_semaine}</b>\n\n"
+        f"Expirés :\n<b>{expires}</b>\n\n"
+        "⚠️ <b>ABONNEMENTS À SURVEILLER</b>"
+    )
+
+    if not lignes:
+        return texte + "\n\nAucun abonnement proche de l'expiration."
+
+    for _, code, statut in lignes[:50]:
+        texte += f"\n\n👤 <code>{echapper_html_texte(code)}</code>\n⏳ {echapper_html_texte(statut)}"
+    return texte
 
 def migrer_si_besoin(data):
     modifie = False
@@ -888,6 +1069,8 @@ def associer_ou_creer_user(user_id, code_cible=None):
         # Si le code correspond déjà au même user numeric (rare), ok
         if uid_code == uid:
             user = data[uid]
+            if client_archive(user):
+                return data, uid, "deleted", None
             ancien_telegram_id = telegram_id_enregistre(user)
             if ancien_telegram_id and ancien_telegram_id != user_id:
                 journaliser_securite("tentative_connexion", code_cible, user_id, ancien_telegram_id)
@@ -905,6 +1088,8 @@ def associer_ou_creer_user(user_id, code_cible=None):
 
         # Si code trouvé sous une autre clé (typiquement la clé est le code)
         user_code = data[uid_code]
+        if client_archive(user_code):
+            return data, uid_code, "deleted", None
         ancien_telegram_id = telegram_id_enregistre(user_code)
         if ancien_telegram_id and ancien_telegram_id != user_id:
             journaliser_securite("tentative_connexion", code_cible, user_id, ancien_telegram_id)
@@ -931,6 +1116,9 @@ def associer_ou_creer_user(user_id, code_cible=None):
 
     # uid existe :
     user = data[uid]
+    if client_archive(user):
+        return data, uid, "deleted", None
+
     ancien_telegram_id = telegram_id_enregistre(user)
     if ancien_telegram_id and ancien_telegram_id != user_id:
         journaliser_securite("tentative_connexion", user.get("code", "?"), user_id, ancien_telegram_id)
@@ -1389,8 +1577,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Erreur Telegram non interceptée.", exc_info=context.error)
 
 def est_admin(update: Update):
-    username = update.effective_user.username if update.effective_user else None
-    return username == ADMIN_USERNAME
+    return est_admin_user(update.effective_user)
 
 async def refuser_non_admin(update: Update):
     if update.effective_message:
@@ -1465,6 +1652,12 @@ async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_T
                 "🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.",
             )
             return False
+        if statut == "deleted":
+            await envoyer_message_acces(
+                update,
+                "🚫 Votre compte client est archivé.\n\nVeuillez contacter l'administrateur.",
+            )
+            return False
         if statut == "ok":
             return True
         # tout autre statut => refuser
@@ -1483,6 +1676,9 @@ async def controler_acces_client(update: Update, context: ContextTypes.DEFAULT_T
     uid = str(user_id)
     if uid in data:
         user = data[uid]
+        if client_archive(user):
+            await envoyer_message_acces(update, "🚫 Votre compte client est archivé.\n\nVeuillez contacter l'administrateur.")
+            return False
         if user.get("banned", False):
             await envoyer_message_acces(update, "🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.")
             return False
@@ -1627,6 +1823,28 @@ def bouton_confirmation_abonnement():
         ]
     )
 
+def bouton_admin_panel():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("👥 Clients", callback_data="admin_clients"),
+                InlineKeyboardButton("👑 Abonnements", callback_data="admin_expirations"),
+            ],
+            [
+                InlineKeyboardButton("📊 Statistiques", callback_data="admin_stats"),
+                InlineKeyboardButton("⚠️ Expirations", callback_data="admin_expirations"),
+            ],
+        ]
+    )
+
+def bouton_confirmation_suppression_client(code):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🗑️ Supprimer", callback_data=f"deleteclient_confirm_{code}")],
+            [InlineKeyboardButton("❌ Annuler", callback_data="deleteclient_cancel")],
+        ]
+    )
+
 async def demander_limite_journaliere(update, code_cible, operation, nombre=None):
     details = f"\n\nSignaux : <b>{nombre}</b>" if nombre is not None else ""
     await update.message.reply_text(
@@ -1758,6 +1976,9 @@ async def appliquer_abonnement_admin(context, admin_chat_id, pending):
     user_cible["restants"] = None
     user_cible["abonnement_type_client"] = type_client
     user_cible["abonnement_jours_restants_activation"] = jours_restants
+    user_cible["subscription_reminders"] = []
+    user_cible.pop("abonnement_expire", None)
+    user_cible.pop("abonnement_expire_at", None)
     historique_abonnements = user_cible.setdefault("historique_abonnements", [])
     historique_abonnements.append(
         {
@@ -1908,6 +2129,99 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("Nouveau client créé: code=%s par uid=%s", code, getattr(update.effective_user, "id", None))
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
+
+@handler_securise
+async def deleteclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/deleteclient CODE</code>\nEx: <code>/deleteclient ABK123</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    await update.message.reply_text(
+        "⚠️ <b>SUPPRESSION CLIENT</b>\n\n"
+        f"Client :\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
+        "Cette action est irréversible côté accès, mais les données seront archivées dans PostgreSQL.\n\n"
+        "Confirmer ?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_confirmation_suppression_client(code_cible),
+    )
+
+@handler_securise
+async def restoreclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/restoreclient CODE</code>\nEx: <code>/restoreclient ABK123</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    user_cible = data[uid_cible]
+    if not client_archive(user_cible):
+        await update.message.reply_text(f"ℹ️ Le client <code>{echapper_html_texte(code_cible)}</code> n'est pas archivé.", parse_mode=ParseMode.HTML)
+        return
+
+    user_cible["deleted"] = False
+    user_cible.pop("deleted_at", None)
+    user_cible.pop("deleted_by", None)
+    sauvegarder_users(data)
+    await update.message.reply_text(
+        "♻️ <b>CLIENT RESTAURÉ</b>\n\n"
+        "Les données précédentes ont été récupérées.",
+        parse_mode=ParseMode.HTML,
+    )
+
+@handler_securise
+async def deleteclient_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "deleteclient_cancel":
+        await query.edit_message_text("Suppression annulée. Aucune donnée modifiée.", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = query.data.replace("deleteclient_confirm_", "", 1).upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await query.edit_message_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    user_cible = data[uid_cible]
+    user_cible["deleted"] = True
+    user_cible["deleted_at"] = datetime.datetime.now().isoformat()
+    user_cible["deleted_by"] = update.effective_user.id
+    sauvegarder_users(data)
+    await query.edit_message_text(
+        "🗑️ <b>CLIENT ARCHIVÉ</b>\n\n"
+        f"Client :\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
+        "Les données PostgreSQL sont conservées et le client peut être restauré avec "
+        f"<code>/restoreclient {echapper_html_texte(code_cible)}</code>.",
+        parse_mode=ParseMode.HTML,
+    )
 @handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
@@ -1991,7 +2305,9 @@ async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         normaliser_signaux_restants(user)
         code = user.get("code", "?")
-        if abonnement_actif(user):
+        if client_archive(user):
+            ligne = f"🚫 <code>{echapper_html_texte(code)}</code> — Archivé"
+        elif abonnement_actif(user):
             vip_debut = user.get("vip_debut")
             vip_fin = user.get("vip_fin")
             jours_restants = jours_restants_jusqua(vip_fin)
@@ -2740,6 +3056,98 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 
 @handler_securise
+async def checksubscriptions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    data = migrer_si_besoin(charger_users())
+    await update.message.reply_text(texte_abonnements_a_surveiller(data), parse_mode=ParseMode.HTML)
+
+@handler_securise
+async def admin_expirations_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = migrer_si_besoin(charger_users())
+    await query.edit_message_text(
+        texte_abonnements_a_surveiller(data),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_admin_panel(),
+    )
+
+@handler_securise
+async def admin_clients_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = migrer_si_besoin(charger_users())
+    utilisateurs = [u for u in data.values() if isinstance(u, dict)]
+    lignes = ["👥 <b>CLIENTS</b>"]
+    for user in utilisateurs[:50]:
+        code = user.get("code", "?")
+        if client_archive(user):
+            icone = "🚫"
+        elif user.get("banned"):
+            icone = "🚫"
+        elif abonnement_actif(user):
+            icone = "👑"
+        elif user.get("vip"):
+            icone = "🟢"
+        else:
+            icone = "⚠️"
+        lignes.append(f"{icone} <code>{echapper_html_texte(code)}</code>")
+
+    if len(lignes) == 1:
+        lignes.append("\nAucun client enregistré.")
+
+    await query.edit_message_text(
+        "\n".join(lignes),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_admin_panel(),
+    )
+
+@handler_securise
+async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = migrer_si_besoin(charger_users())
+    utilisateurs = [u for u in data.values() if isinstance(u, dict)]
+    total = len(utilisateurs)
+    actifs = sum(1 for u in utilisateurs if abonnement_actif(u) or u.get("vip"))
+    vip = sum(1 for u in utilisateurs if u.get("vip"))
+    bannis = sum(1 for u in utilisateurs if u.get("banned"))
+    ventes = charger_journal_ventes()
+    recharges = sum(1 for e in ventes if isinstance(e, dict) and e.get("type") == "recharge")
+    abonnements = sum(1 for e in ventes if isinstance(e, dict) and e.get("type") == "abonnement")
+    signaux_utilises = sum(len(u.get("historique_signaux", [])) for u in utilisateurs if isinstance(u.get("historique_signaux"), list))
+    texte = (
+        "📊 <b>STATISTIQUES</b>\n\n"
+        "CLIENTS\n\n"
+        f"Total :\n<b>{total}</b>\n\n"
+        f"Actifs :\n<b>{actifs}</b>\n\n"
+        f"VIP :\n<b>{vip}</b>\n\n"
+        f"Bannis :\n<b>{bannis}</b>\n\n"
+        "BUSINESS\n\n"
+        f"Recharges :\n<b>{recharges}</b>\n\n"
+        f"Abonnements :\n<b>{abonnements}</b>\n\n"
+        "UTILISATION\n\n"
+        f"Signaux utilisés :\n<b>{signaux_utilises}</b>"
+    )
+    await query.edit_message_text(texte, parse_mode=ParseMode.HTML, reply_markup=bouton_admin_panel())
+
+@handler_securise
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
         await refuser_non_admin(update)
@@ -2747,9 +3155,23 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sauvegarder_admin_id(update.effective_user.id)
     await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "💥 <b>CRASH ADMIN PANEL</b>\n\n"
+        "🇷🇺 <b>ПАНЕЛЬ УПРАВЛЕНИЯ</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "👥 Clients\n"
+        "💰 Recharges\n"
+        "👑 Abonnements\n"
+        "📊 Statistiques\n"
+        "📢 Broadcast\n"
+        "🚫 Sécurité\n"
+        "⚙️ Paramètres\n"
+        "⚠️ Expirations\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
         "🛠 Commandes admin disponibles :\n\n"
         "<code>/clients</code> — Liste tous les clients et leur statut\n"
         "<code>/stats</code> — Statistiques générales du bot\n"
+        "<code>/checksubscriptions</code> — Abonnements proches de l'expiration\n"
         "<code>/recharge CODE NOMBRE</code> — Recharge un VIP classique\n"
         "<code>/vip CODE</code> — Active le VIP classique, sans signaux automatiques\n"
         "<code>/devip CODE</code> — Retire le statut VIP d'un client\n"
@@ -2763,8 +3185,11 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/reset CODE</code> — Réinitialise complètement un client\n"
         "<code>/broadcast</code> — Diffuse un message à tous les utilisateurs\n"
         "<code>/createclient</code> — Crée automatiquement un client et génère le lien d'invitation\n"
+        "<code>/deleteclient CODE</code> — Archive un client après confirmation\n"
+        "<code>/restoreclient CODE</code> — Restaure un client archivé\n"
         "<code>/admin</code> — Affiche ce menu",
         parse_mode=ParseMode.HTML,
+        reply_markup=bouton_admin_panel(),
     )
 
 @handler_securise
@@ -3185,28 +3610,89 @@ async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
     data = migrer_si_besoin(charger_users())
     maintenant = datetime.datetime.now()
     expires = []
+    rappels = []
+    modifie = False
 
     for uid, user in data.items():
         if not isinstance(user, dict):
             continue
+
+        if abonnement_actif(user, maintenant=maintenant):
+            jours_restants = jours_restants_jusqua(user.get("vip_fin"), maintenant=maintenant)
+            seuil = choisir_rappel_abonnement(user, jours_restants)
+            if seuil:
+                code = user.get("code", "?")
+                date_fin = formater_date(user.get("vip_fin"))
+                rappels.append(
+                    (
+                        uid,
+                        chat_id_client(uid, user),
+                        code,
+                        jours_restants,
+                        seuil,
+                        date_fin,
+                        texte_rappel_abonnement(user, jours_restants, seuil),
+                    )
+                )
+            continue
+
         if abonnement_expire(user, maintenant=maintenant):
             code = user.get("code", "?")
             date_fin = formater_date(user["vip_fin"])
-            remettre_en_mode_gratuit(user)
-            expires.append((uid, code, date_fin, texte_expiration(user)))
+            message_client = texte_expiration(user)
+            suspendre_abonnement_expire(user, maintenant=maintenant)
+            expires.append((uid, chat_id_client(uid, user), code, date_fin, message_client))
+            modifie = True
 
-    if expires:
+    if modifie:
         sauvegarder_users(data)
 
-    for uid, code, date_fin, message_client in expires:
+    for uid, chat_id, code, jours_restants, seuil, date_fin, message_client in rappels:
+        if not chat_id:
+            logger.info("Rappel abonnement non envoye pour %s: aucun Telegram ID.", code)
+            continue
+
+        envoye = False
         try:
             await context.bot.send_message(
-                chat_id=int(uid),
+                chat_id=chat_id,
                 text=message_client,
                 parse_mode=ParseMode.HTML,
             )
+            envoye = True
         except TelegramError:
-            logger.exception("Impossible de notifier le client %s pour l'expiration.", uid)
+            logger.exception("Impossible de notifier le client %s pour le rappel %s jours.", uid, seuil)
+
+        if envoye:
+            user = data.get(str(uid))
+            if not isinstance(user, dict):
+                user = data.get(uid)
+            if isinstance(user, dict):
+                enregistrer_rappel_abonnement(user, seuil, maintenant=maintenant)
+                sauvegarder_users(data)
+
+            if admin_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=texte_alerte_admin_abonnement(code, jours_restants, date_fin),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    logger.exception("Impossible de notifier l'admin pour le rappel %s.", code)
+
+    for uid, chat_id, code, date_fin, message_client in expires:
+        if chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message_client,
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                logger.exception("Impossible de notifier le client %s pour l'expiration.", uid)
+        else:
+            logger.info("Expiration non notifiee au client %s: aucun Telegram ID.", code)
 
         if admin_id:
             try:
@@ -3338,15 +3824,22 @@ def creer_application():
     app.add_handler(CommandHandler("addsignal", addsignal_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("checksubscriptions", checksubscriptions_cmd))
     app.add_handler(CommandHandler("admin", admin_help))
     # Nouvelle commande createclient
     app.add_handler(CommandHandler("createclient", createclient_cmd))
+    app.add_handler(CommandHandler("deleteclient", deleteclient_cmd))
+    app.add_handler(CommandHandler("restoreclient", restoreclient_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_message))
     
     # Handlers de callback - Menu principal
     app.add_handler(CallbackQueryHandler(choix_limite_journaliere_callback, pattern="^daily_limit_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(choix_type_client_abonnement_callback, pattern="^subscription_client_(new|old)$"))
     app.add_handler(CallbackQueryHandler(confirmation_abonnement_callback, pattern="^subscription_confirm_(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(admin_clients_callback, pattern="^admin_clients$"))
+    app.add_handler(CallbackQueryHandler(admin_stats_callback, pattern="^admin_stats$"))
+    app.add_handler(CallbackQueryHandler(admin_expirations_callback, pattern="^admin_expirations$"))
+    app.add_handler(CallbackQueryHandler(deleteclient_confirmation_callback, pattern="^deleteclient_(confirm_[A-Z0-9]+|cancel)$"))
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
     app.add_handler(CallbackQueryHandler(compte_menu_callback, pattern="^compte_menu$"))
     app.add_handler(CallbackQueryHandler(vip_menu_callback, pattern="^vip_menu$"))
