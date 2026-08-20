@@ -44,6 +44,7 @@ SAFE_DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 POSTGRES_SCHEMA = os.getenv("CRASH_DB_SCHEMA", "crash")
 CRASH_TIMEZONE = os.getenv("CRASH_TIMEZONE", "Africa/Abidjan")
 SUBSCRIPTION_REMINDER_DAYS = (7, 3, 1)
+ADMIN_CLIENTS_PAGE_SIZE = 8
 
 # Configuration du groupe de journalisation (0 = désactivé)
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))  # mettre -100... dans l'env pour activer
@@ -355,10 +356,12 @@ def valeur_entier(data, *cles):
     return None
 
 def sauvegarder_users_postgres(cur, data, supprimer_absents=False):
+    cles_presentes = []
     for uid, user in data.items():
         if not isinstance(user, dict):
             continue
         user_key = str(uid)
+        cles_presentes.append(user_key)
         cur.execute(
             """
             INSERT INTO users (user_key, telegram_id, username, code_client, data, updated_at)
@@ -378,6 +381,11 @@ def sauvegarder_users_postgres(cur, data, supprimer_absents=False):
                 Jsonb(user),
             ),
         )
+    if supprimer_absents:
+        if cles_presentes:
+            cur.execute("DELETE FROM users WHERE NOT (user_key = ANY(%s))", (cles_presentes,))
+        else:
+            cur.execute("DELETE FROM users")
 
 def lire_json(path, default):
     initialiser_base_de_donnees()
@@ -418,7 +426,7 @@ def ecrire_json(path, data):
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 if path == DATA_FILE:
-                    sauvegarder_users_postgres(cur, data)
+                    sauvegarder_users_postgres(cur, data, supprimer_absents=True)
                 elif path == ADMIN_ID_FILE:
                     cur.execute(
                         """
@@ -868,6 +876,105 @@ def chat_id_client(uid, user):
 def client_archive(user):
     return bool(isinstance(user, dict) and user.get("deleted"))
 
+def creer_client_dans_data(data):
+    code = generer_code_unique(data)
+    maintenant = datetime.datetime.now().isoformat()
+    data[code] = {
+        "restants": SIGNAUX_DEFAUT,
+        "vip": False,
+        "code": code,
+        "telegram_id": None,
+        "banned": False,
+        "gratuits_deja_donnes": True,
+        "signaux_gratuits_restants": SIGNAUX_DEFAUT,
+        "vip_signals": 0,
+        "illimite": False,
+        "historique_signaux": [],
+        "messages": [],
+        "created_at": maintenant,
+        "first_connection": None,
+        "invitation_used": False,
+    }
+    return code, maintenant
+
+def lien_invitation_client(context, code):
+    bot_username = getattr(context.bot, "username", None)
+    if bot_username:
+        return f"https://t.me/{bot_username}?start={code}"
+    return f"https://t.me/YourBotUsername?start={code}"
+
+def texte_client_cree(code, created_at, lien=None):
+    date_txt = datetime.datetime.fromisoformat(created_at).strftime("%d/%m/%Y")
+    texte = (
+        "✅ <b>CLIENT CRÉÉ</b>\n\n"
+        f"Code :\n<code>{echapper_html_texte(code)}</code>\n\n"
+        "Statut :\nNouveau client\n\n"
+        f"Date :\n<b>{echapper_html_texte(date_txt)}</b>"
+    )
+    if lien:
+        texte += f"\n\n🔗 Lien d'invitation :\n{echapper_html_texte(lien)}"
+    return texte
+
+def statut_client_admin(user):
+    if client_archive(user):
+        return "🚫 Archivé"
+    if user.get("banned"):
+        return "🚫 Banni"
+    if abonnement_actif(user):
+        return "👑 Premium"
+    if user.get("vip"):
+        return "⭐ VIP"
+    return "⚠️ Standard"
+
+def texte_fiche_client_admin(uid, user):
+    normaliser_signaux_restants(user)
+    if abonnement_actif(user):
+        abonnement = "ACTIF"
+        signaux = "Illimité"
+    elif user.get("vip"):
+        abonnement = "INACTIF"
+        signaux = normaliser_signaux_vip(user)
+    else:
+        abonnement = "INACTIF"
+        signaux = normaliser_signaux_gratuits(user)
+
+    utilises, limite, limite_active = normaliser_limite_journaliere(user)
+    limite_txt = f"{limite}/jour" if limite_active else "Aucune"
+    utilisation_txt = f"{utilises}/{limite} aujourd'hui" if limite_active else "-"
+    telegram_id = user.get("telegram_id") or (uid if str(uid).isdigit() else "-")
+    return (
+        "👤 <b>CLIENT</b>\n\n"
+        f"Code :\n<code>{echapper_html_texte(user.get('code', '?'))}</code>\n\n"
+        f"Telegram :\n<code>{echapper_html_texte(telegram_id)}</code>\n\n"
+        f"Statut :\n{statut_client_admin(user)}\n\n"
+        f"Signaux :\n<b>{echapper_html_texte(signaux)}</b>\n\n"
+        f"Abonnement :\n<b>{abonnement}</b>\n\n"
+        f"Expiration :\n<b>{echapper_html_texte(formater_date(user.get('vip_fin')) if user.get('vip_fin') else '-')}</b>\n\n"
+        f"Limite :\n<b>{echapper_html_texte(limite_txt)}</b>\n\n"
+        f"Utilisation :\n<b>{echapper_html_texte(utilisation_txt)}</b>"
+    )
+
+def texte_historique_client(user):
+    lignes = ["📊 <b>HISTORIQUE CLIENT</b>"]
+    historique = []
+    for entree in user.get("historique_abonnements", [])[-10:]:
+        if isinstance(entree, dict):
+            historique.append((entree.get("enregistre_le", ""), "👑 Abonnement activé"))
+    for entree in user.get("historique_signaux", [])[-10:]:
+        if isinstance(entree, dict):
+            historique.append((entree.get("date", ""), "🎯 Signal utilisé"))
+    historique.sort(key=lambda item: item[0] or "", reverse=True)
+    if not historique:
+        return "\n\n".join(lignes + ["Aucun historique disponible."])
+    for date_txt, label in historique[:10]:
+        try:
+            dt = datetime.datetime.fromisoformat(date_txt)
+            date_affichee = dt.strftime("%d/%m")
+        except Exception:
+            date_affichee = "-"
+        lignes.append(f"{date_affichee}\n{label}")
+    return "\n\n".join(lignes)
+
 def choisir_rappel_abonnement(user, jours_restants):
     if jours_restants < 0:
         return None
@@ -936,7 +1043,7 @@ def collecter_abonnements_a_surveiller(data, maintenant=None):
     expires = 0
 
     for user in data.values():
-        if not isinstance(user, dict) or not user.get("vip_fin"):
+        if not isinstance(user, dict) or client_archive(user) or not user.get("vip_fin"):
             continue
 
         fin = date_depuis_timestamp(user.get("vip_fin"))
@@ -1828,7 +1935,11 @@ def bouton_admin_panel():
         [
             [
                 InlineKeyboardButton("👥 Clients", callback_data="admin_clients"),
+                InlineKeyboardButton("➕ Nouveau", callback_data="admin_new_client"),
+            ],
+            [
                 InlineKeyboardButton("👑 Abonnements", callback_data="admin_expirations"),
+                InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
             ],
             [
                 InlineKeyboardButton("📊 Statistiques", callback_data="admin_stats"),
@@ -1843,6 +1954,124 @@ def bouton_confirmation_suppression_client(code):
             [InlineKeyboardButton("🗑️ Supprimer", callback_data=f"deleteclient_confirm_{code}")],
             [InlineKeyboardButton("❌ Annuler", callback_data="deleteclient_cancel")],
         ]
+    )
+
+def bouton_confirmation_action_client(action, code):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Confirmer", callback_data=f"confirm_{action}_{code}")],
+            [InlineKeyboardButton("❌ Annuler", callback_data=f"confirm_cancel_{code}")],
+        ]
+    )
+
+def bouton_fiche_client_admin(code):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💰 Recharge", callback_data=f"admin_action_recharge_{code}"),
+                InlineKeyboardButton("➕ Signaux", callback_data=f"admin_action_addsignal_{code}"),
+            ],
+            [
+                InlineKeyboardButton("👑 Abonnement", callback_data=f"admin_action_abonnement_{code}"),
+                InlineKeyboardButton("❌ Désabonner", callback_data=f"admin_action_desabo_{code}"),
+            ],
+            [
+                InlineKeyboardButton("⭐ VIP", callback_data=f"admin_action_vip_{code}"),
+                InlineKeyboardButton("❌ Retirer VIP", callback_data=f"admin_action_devip_{code}"),
+            ],
+            [
+                InlineKeyboardButton("🚫 Bannir", callback_data=f"admin_action_ban_{code}"),
+                InlineKeyboardButton("✅ Débannir", callback_data=f"admin_action_unban_{code}"),
+            ],
+            [
+                InlineKeyboardButton("📊 Historique", callback_data=f"admin_action_history_{code}"),
+                InlineKeyboardButton("🗑️ Supprimer", callback_data=f"admin_action_delete_{code}"),
+            ],
+            [InlineKeyboardButton("🔙 Retour", callback_data="admin_clients_page_0")],
+        ]
+    )
+
+def bouton_montants_admin(prefix, code):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("50", callback_data=f"{prefix}_{code}_50"),
+                InlineKeyboardButton("100", callback_data=f"{prefix}_{code}_100"),
+            ],
+            [
+                InlineKeyboardButton("250", callback_data=f"{prefix}_{code}_250"),
+                InlineKeyboardButton("500", callback_data=f"{prefix}_{code}_500"),
+            ],
+            [InlineKeyboardButton("Autre", callback_data=f"admin_action_{'recharge' if prefix == 'admin_recharge' else 'addsignal'}_{code}")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"admin_client_{code}")],
+        ]
+    )
+
+def bouton_clients_admin(data, page=0):
+    clients = [user for user in data.values() if isinstance(user, dict) and user.get("code")]
+    clients.sort(key=lambda user: str(user.get("code", "")))
+    total_pages = max(1, (len(clients) + ADMIN_CLIENTS_PAGE_SIZE - 1) // ADMIN_CLIENTS_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    debut = page * ADMIN_CLIENTS_PAGE_SIZE
+    rows = []
+    for user in clients[debut:debut + ADMIN_CLIENTS_PAGE_SIZE]:
+        code = user.get("code", "?")
+        rows.append([InlineKeyboardButton(f"{statut_client_admin(user).split()[0]} {code}", callback_data=f"admin_client_{code}")])
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("◀️", callback_data=f"admin_clients_page_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"admin_clients_page_{page}"))
+    if page < total_pages - 1:
+        navigation.append(InlineKeyboardButton("▶️", callback_data=f"admin_clients_page_{page + 1}"))
+    rows.append(navigation)
+    rows.append([InlineKeyboardButton("➕ Nouveau client", callback_data="admin_new_client")])
+    rows.append([InlineKeyboardButton("🔙 Admin", callback_data="admin_home")])
+    return InlineKeyboardMarkup(rows), page, total_pages, len(clients)
+
+def texte_clients_admin(total, page, total_pages):
+    return (
+        "👥 <b>CLIENTS</b>\n\n"
+        f"Total : <b>{total}</b>\n"
+        f"Page : <b>{page + 1}/{total_pages}</b>\n\n"
+        "Sélectionnez un client pour ouvrir sa fiche."
+    )
+
+def texte_admin_panel():
+    return (
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "💥 <b>CRASH ADMIN PANEL</b>\n\n"
+        "🇷🇺 <b>ПАНЕЛЬ УПРАВЛЕНИЯ</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "👥 Clients\n"
+        "💰 Recharges\n"
+        "👑 Abonnements\n"
+        "📊 Statistiques\n"
+        "📢 Broadcast\n"
+        "🚫 Sécurité\n"
+        "⚙️ Paramètres\n"
+        "⚠️ Expirations\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🛠 Commandes admin disponibles :\n\n"
+        "<code>/clients</code> — Liste tous les clients et leur statut\n"
+        "<code>/stats</code> — Statistiques générales du bot\n"
+        "<code>/checksubscriptions</code> — Abonnements proches de l'expiration\n"
+        "<code>/recharge CODE NOMBRE</code> — Recharge un VIP classique\n"
+        "<code>/vip CODE</code> — Active le VIP classique, sans signaux automatiques\n"
+        "<code>/devip CODE</code> — Retire le statut VIP d'un client\n"
+        "<code>/abonnement CODE</code> — Abonnement VIP illimité 30j\n"
+        "<code>/desabo CODE</code> — Coupe l'abonnement mensuel d'un client\n"
+        "<code>/resetdevice CODE</code> — Réinitialise le Telegram ID associé\n"
+        "<code>/ban CODE</code> — Bannit définitivement un client\n"
+        "<code>/unban CODE</code> — Retire le bannissement\n"
+        "<code>/info CODE</code> — Affiche la fiche complète du client\n"
+        "<code>/addsignal CODE NOMBRE</code> — Ajoute des signaux au solde\n"
+        "<code>/reset CODE</code> — Réinitialise complètement un client\n"
+        "<code>/broadcast</code> — Diffuse un message à tous les utilisateurs\n"
+        "<code>/createclient</code> — Crée automatiquement un client et génère le lien d'invitation\n"
+        "<code>/deleteclient CODE</code> — Supprime complètement un client après confirmation\n"
+        "<code>/restoreclient CODE</code> — Restaure seulement un ancien client archivé\n"
+        "<code>/admin</code> — Affiche ce menu"
     )
 
 async def demander_limite_journaliere(update, code_cible, operation, nombre=None):
@@ -1891,8 +2120,11 @@ async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, l
     )
 
     try:
+        chat_id = chat_id_client(uid_cible, user_cible)
+        if not chat_id:
+            raise ValueError("Aucun Telegram ID client")
         await context.bot.send_message(
-            chat_id=int(uid_cible),
+            chat_id=chat_id,
             text=(
                 "🎉 Bonne nouvelle !\n\n"
                 "Tes signaux VIP ont été rechargés par l'administrateur.\n"
@@ -1902,7 +2134,7 @@ async def appliquer_recharge_admin(context, admin_chat_id, code_cible, nombre, l
             ),
             parse_mode=ParseMode.HTML,
         )
-    except TelegramError:
+    except (TelegramError, ValueError):
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
     try:
@@ -2022,8 +2254,11 @@ async def appliquer_abonnement_admin(context, admin_chat_id, pending):
     )
 
     try:
+        chat_id = chat_id_client(uid_cible, user_cible)
+        if not chat_id:
+            raise ValueError("Aucun Telegram ID client")
         await context.bot.send_message(
-            chat_id=int(uid_cible),
+            chat_id=chat_id,
             text=(
                 "\U0001f389 Ton abonnement <b>VIP</b> est active ! \U0001f451\n\n"
                 f"\U0001f4c5 Debut : <b>{debut.strftime('%d/%m/%Y')}</b>\n"
@@ -2035,7 +2270,7 @@ async def appliquer_abonnement_admin(context, admin_chat_id, pending):
             ),
             parse_mode=ParseMode.HTML,
         )
-    except TelegramError:
+    except (TelegramError, ValueError):
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
     try:
@@ -2062,6 +2297,56 @@ async def appliquer_abonnement_admin(context, admin_chat_id, pending):
 
     await _envoyer_notification_groupe(context, notif)
 
+async def appliquer_ajout_signaux_admin(context, admin_chat_id, code_cible, nombre):
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await context.bot.send_message(
+            chat_id=admin_chat_id,
+            text=f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user = data[uid_cible]
+    appliquer_expiration_si_necessaire(user)
+    actuel = normaliser_signaux_vip(user) if user.get("vip") else 0
+    total = actuel + nombre
+    normaliser_signaux_gratuits(user)
+    user["vip"] = True
+    user["illimite"] = False
+    user["vip_signals"] = total
+    user["restants"] = total
+    user.pop("vip_debut", None)
+    user.pop("vip_fin", None)
+    sauvegarder_users(data)
+
+    await context.bot.send_message(
+        chat_id=admin_chat_id,
+        text=(
+            "➕ <b>SIGNAUX AJOUTÉS</b>\n\n"
+            f"Client :\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
+            f"Signaux ajoutés :\n<b>+{nombre}</b>\n\n"
+            f"Nouveau solde :\n<b>{total}</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    chat_id = chat_id_client(uid_cible, user)
+    if chat_id:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🎉 <b>Signaux ajoutés</b>\n\n"
+                    f"Ajout : <b>+{nombre}</b>\n"
+                    f"Nouveau solde : <b>{total}</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            logger.exception("Impossible de notifier le client %s pour l'ajout de signaux.", uid_cible)
+
 # --- NOUVELLE COMMANDE ADMIN : /createclient ---
 @handler_securise
 async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2072,30 +2357,8 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await refuser_non_admin(update)
         return
 
-    # Charger et migrer les users (s'assurer qu'il n'y a pas de doublon)
     data = migrer_si_besoin(charger_users())
-
-    # Générer code unique
-    code = generer_code_unique(data)
-    maintenant = datetime.datetime.now().isoformat()
-
-    # Créer l'entrée utilisateur associée au code (clé = code). Telegram ID = None
-    data[code] = {
-        "restants": SIGNAUX_DEFAUT,
-        "vip": False,
-        "code": code,
-        "telegram_id": None,
-        "banned": False,
-        "gratuits_deja_donnes": True,
-        "signaux_gratuits_restants": SIGNAUX_DEFAUT,
-        "vip_signals": 0,
-        "illimite": False,
-        "historique_signaux": [],
-        "messages": [],
-        "created_at": maintenant,
-        "first_connection": None,
-        "invitation_used": False,
-    }
+    code, maintenant = creer_client_dans_data(data)
 
     ok = safe_sauvegarder_users(data)
     if not ok:
@@ -2105,27 +2368,7 @@ async def createclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Construction du lien d'invitation en utilisant le nom du bot
-    try:
-        bot_username = context.bot.username
-    except Exception:
-        bot_username = None
-
-    if bot_username:
-        lien = f"https://t.me/{bot_username}?start={code}"
-    else:
-        lien = f"https://t.me/YourBotUsername?start={code}"
-
-    texte = (
-        "✅ Nouveau client créé\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👤 Code client\n\n"
-        f"{code}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🔗 Lien d'invitation\n\n"
-        f"{lien}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
+    texte = texte_client_cree(code, maintenant, lien=lien_invitation_client(context, code))
 
     logger.info("Nouveau client créé: code=%s par uid=%s", code, getattr(update.effective_user, "id", None))
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
@@ -2151,7 +2394,8 @@ async def deleteclient_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚠️ <b>SUPPRESSION CLIENT</b>\n\n"
         f"Client :\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
-        "Cette action est irréversible côté accès, mais les données seront archivées dans PostgreSQL.\n\n"
+        "Cette action supprime complètement le client, ses doublons éventuels et son accès au bot.\n\n"
+        "Après suppression, il faudra créer un nouveau client et lui envoyer un nouveau lien.\n\n"
         "Confirmer ?",
         parse_mode=ParseMode.HTML,
         reply_markup=bouton_confirmation_suppression_client(code_cible),
@@ -2210,16 +2454,20 @@ async def deleteclient_confirmation_callback(update: Update, context: ContextTyp
         await query.edit_message_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
-    user_cible = data[uid_cible]
-    user_cible["deleted"] = True
-    user_cible["deleted_at"] = datetime.datetime.now().isoformat()
-    user_cible["deleted_by"] = update.effective_user.id
+    uids_a_supprimer = [
+        uid
+        for uid, user in list(data.items())
+        if isinstance(user, dict) and str(user.get("code", "")).upper() == code_cible
+    ]
+    for uid in uids_a_supprimer:
+        data.pop(uid, None)
     sauvegarder_users(data)
     await query.edit_message_text(
-        "🗑️ <b>CLIENT ARCHIVÉ</b>\n\n"
+        "🗑️ <b>CLIENT SUPPRIMÉ</b>\n\n"
         f"Client :\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
-        "Les données PostgreSQL sont conservées et le client peut être restauré avec "
-        f"<code>/restoreclient {echapper_html_texte(code_cible)}</code>.",
+        f"Entrées supprimées :\n<b>{len(uids_a_supprimer)}</b>\n\n"
+        "L'ancien accès est refusé. Créez un nouveau client avec <code>/createclient</code> "
+        "et envoyez-lui le nouveau lien.",
         parse_mode=ParseMode.HTML,
     )
 @handler_securise
@@ -2363,8 +2611,11 @@ async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        chat_id = chat_id_client(uid_cible, user_cible)
+        if not chat_id:
+            raise ValueError("Aucun Telegram ID client")
         await context.bot.send_message(
-            chat_id=int(uid_cible),
+            chat_id=chat_id,
             text=(
                 "🎉 Félicitations !\n\n"
                 "👑 Votre compte VIP est maintenant activé.\n"
@@ -2373,7 +2624,7 @@ async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             parse_mode=ParseMode.HTML,
         )
-    except TelegramError:
+    except (TelegramError, ValueError):
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
 @handler_securise
@@ -2421,26 +2672,14 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
-    gratuits = remettre_en_mode_gratuit(data[uid_cible])
-    sauvegarder_users(data)
-    statut = (
-        f"⚡ Il reste <b>{gratuits}</b> signal{'s' if gratuits > 1 else ''} gratuit{'s' if gratuits > 1 else ''}."
-        if gratuits > 0
-        else "❌ Vous avez épuisé vos signaux gratuits.\n\n💎 Contactez l'administrateur pour recharger votre compte."
-    )
     await update.message.reply_text(
-        f"✅ Statut VIP retiré au client <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}",
+        "⚠️ <b>RETIRER VIP ?</b>\n\n"
+        f"Client :\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
+        "Le compte, l'historique et les paiements seront conservés.\n\n"
+        "Confirmer ?",
         parse_mode=ParseMode.HTML,
+        reply_markup=bouton_confirmation_action_client("devip", code_cible),
     )
-
-    try:
-        await context.bot.send_message(
-            chat_id=int(uid_cible),
-            text=f"⚠️ Votre statut VIP a été retiré.\n\n{statut}",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        logger.exception("Impossible de notifier le client %s.", uid_cible)
 
 @handler_securise
 async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2461,31 +2700,74 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
-    gratuits = remettre_en_mode_gratuit(data[uid_cible])
+    await update.message.reply_text(
+        "⚠️ <b>DÉSACTIVER ABONNEMENT ?</b>\n\n"
+        f"Client :\n<code>{echapper_html_texte(code_cible)}</code>\n\n"
+        "Le client, l'historique, les signaux et les paiements seront conservés.\n\n"
+        "Confirmer ?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_confirmation_action_client("desabo", code_cible),
+    )
+
+@handler_securise
+async def confirmation_action_client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    cancel_match = re.match(r"^confirm_cancel_([A-Z0-9]+)$", query.data or "")
+    if cancel_match:
+        code = cancel_match.group(1)
+        await query.edit_message_text(
+            f"Action annulée pour <code>{echapper_html_texte(code)}</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bouton_fiche_client_admin(code),
+        )
+        return
+
+    match = re.match(r"^confirm_(devip|desabo)_([A-Z0-9]+)$", query.data or "")
+    if not match:
+        await query.edit_message_text("Confirmation invalide.", parse_mode=ParseMode.HTML, reply_markup=bouton_admin_panel())
+        return
+
+    action, code_cible = match.group(1), match.group(2)
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+    if uid_cible is None:
+        await query.edit_message_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    user = data[uid_cible]
+    gratuits = remettre_en_mode_gratuit(user)
     sauvegarder_users(data)
     statut = (
         f"⚡ Il reste <b>{gratuits}</b> signal{'s' if gratuits > 1 else ''} gratuit{'s' if gratuits > 1 else ''}."
         if gratuits > 0
         else "❌ Vous avez épuisé vos signaux gratuits.\n\n💎 Contactez l'administrateur."
     )
-    await update.message.reply_text(
-        f"✅ Abonnement mensuel coupé pour <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}",
-        parse_mode=ParseMode.HTML,
-    )
 
-    try:
-        await context.bot.send_message(
-            chat_id=int(uid_cible),
-            text=(
-
-                "⚠️ Ton abonnement mensuel VIP a été désactivé.\n\n"
-                f"{statut}\n\n"
-                f"Pour renouveler, contacte l'admin : {admin_username_html()}"
-            ),
-            parse_mode=ParseMode.HTML,
+    if action == "devip":
+        texte_admin = f"✅ Statut VIP retiré au client <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}"
+        texte_client = f"⚠️ Votre statut VIP a été retiré.\n\n{statut}"
+    else:
+        texte_admin = f"✅ Abonnement mensuel coupé pour <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}"
+        texte_client = (
+            "⚠️ Ton abonnement mensuel VIP a été désactivé.\n\n"
+            f"{statut}\n\n"
+            f"Pour renouveler, contacte l'admin : {admin_username_html()}"
         )
-    except TelegramError:
-        logger.exception("Impossible de notifier le client %s.", uid_cible)
+
+    await query.edit_message_text(texte_admin, parse_mode=ParseMode.HTML, reply_markup=bouton_fiche_client_admin(code_cible))
+
+    chat_id = chat_id_client(uid_cible, user)
+    if chat_id:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=texte_client, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            logger.exception("Impossible de notifier le client %s.", uid_cible)
 
 @handler_securise
 async def resetdevice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2531,16 +2813,20 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
-    data[uid_cible]["banned"] = True
+    user_cible = data[uid_cible]
+    user_cible["banned"] = True
     sauvegarder_users(data)
     await update.message.reply_text(f"✅ Client <code>{echapper_html_texte(code_cible)}</code> banni.", parse_mode=ParseMode.HTML)
     try:
+        chat_id = chat_id_client(uid_cible, user_cible)
+        if not chat_id:
+            raise ValueError("Aucun Telegram ID client")
         await context.bot.send_message(
-            chat_id=int(uid_cible),
+            chat_id=chat_id,
             text="🚫 Votre accès a été suspendu.\n\nVeuillez contacter l'administrateur.",
             parse_mode=ParseMode.HTML,
         )
-    except TelegramError:
+    except (TelegramError, ValueError):
         logger.exception("Impossible de notifier le client banni %s.", uid_cible)
 
 @handler_securise
@@ -2561,9 +2847,21 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
-    data[uid_cible]["banned"] = False
+    user_cible = data[uid_cible]
+    user_cible["banned"] = False
     sauvegarder_users(data)
     await update.message.reply_text(f"✅ Client <code>{echapper_html_texte(code_cible)}</code> débanni.", parse_mode=ParseMode.HTML)
+    try:
+        chat_id = chat_id_client(uid_cible, user_cible)
+        if not chat_id:
+            raise ValueError("Aucun Telegram ID client")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="✅ ACCÈS RESTAURÉ\n\nVotre accès est de nouveau actif.",
+            parse_mode=ParseMode.HTML,
+        )
+    except (TelegramError, ValueError):
+        logger.exception("Impossible de notifier le client débanni %s.", uid_cible)
 
 @handler_securise
 async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2589,9 +2887,12 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sauvegarder_users(data)
 
     try:
-        chat = await context.bot.get_chat(int(uid_cible))
+        chat_id = chat_id_client(uid_cible, user)
+        if not chat_id:
+            raise ValueError("Aucun Telegram ID client")
+        chat = await context.bot.get_chat(chat_id)
         nom = chat.full_name or chat.username or "Inconnu"
-    except TelegramError:
+    except (TelegramError, ValueError):
         nom = "Inconnu"
 
     if abonnement_actif(user):
@@ -2670,8 +2971,11 @@ async def addsignal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
     try:
+        chat_id = chat_id_client(uid_cible, user)
+        if not chat_id:
+            raise ValueError("Aucun Telegram ID client")
         await context.bot.send_message(
-            chat_id=int(uid_cible),
+            chat_id=chat_id,
             text=(
 
                 "━━━━━━━━━━━━━━━━━━\n"
@@ -2686,7 +2990,7 @@ async def addsignal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             parse_mode=ParseMode.HTML,
         )
-    except TelegramError:
+    except (TelegramError, ValueError):
         logger.exception("Impossible de notifier le client %s pour l'ajout de signaux.", uid_cible)
 
 @handler_securise
@@ -2995,11 +3299,14 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     echecs = 0
 
     for uid, user in data.items():
-        if not isinstance(user, dict) or user.get("banned", False):
+        if not isinstance(user, dict) or user.get("banned", False) or client_archive(user):
             continue
         try:
+            chat_id = chat_id_client(uid, user)
+            if not chat_id:
+                raise ValueError("Aucun Telegram ID client")
             await context.bot.send_message(
-                chat_id=int(user.get("telegram_id") or uid),
+                chat_id=chat_id,
                 text=update.message.text,
             )
             envoyes += 1
@@ -3025,7 +3332,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sauvegarder_admin_id(update.effective_user.id)
     data = migrer_si_besoin(charger_users())
-    utilisateurs = [u for u in data.values() if isinstance(u, dict)]
+    utilisateurs = [u for u in data.values() if isinstance(u, dict) and not client_archive(u)]
     total = len(utilisateurs)
     abonnements = sum(1 for u in utilisateurs if abonnement_actif(u))
     vip_classiques = sum(1 for u in utilisateurs if u.get("vip") and not abonnement_actif(u))
@@ -3089,29 +3396,13 @@ async def admin_clients_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     data = migrer_si_besoin(charger_users())
-    utilisateurs = [u for u in data.values() if isinstance(u, dict)]
-    lignes = ["👥 <b>CLIENTS</b>"]
-    for user in utilisateurs[:50]:
-        code = user.get("code", "?")
-        if client_archive(user):
-            icone = "🚫"
-        elif user.get("banned"):
-            icone = "🚫"
-        elif abonnement_actif(user):
-            icone = "👑"
-        elif user.get("vip"):
-            icone = "🟢"
-        else:
-            icone = "⚠️"
-        lignes.append(f"{icone} <code>{echapper_html_texte(code)}</code>")
-
-    if len(lignes) == 1:
-        lignes.append("\nAucun client enregistré.")
-
+    match = re.match(r"^admin_clients_page_(\d+)$", query.data or "")
+    page = int(match.group(1)) if match else 0
+    markup, page, total_pages, total = bouton_clients_admin(data, page=page)
     await query.edit_message_text(
-        "\n".join(lignes),
+        texte_clients_admin(total, page, total_pages),
         parse_mode=ParseMode.HTML,
-        reply_markup=bouton_admin_panel(),
+        reply_markup=markup,
     )
 
 @handler_securise
@@ -3123,7 +3414,7 @@ async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     data = migrer_si_besoin(charger_users())
-    utilisateurs = [u for u in data.values() if isinstance(u, dict)]
+    utilisateurs = [u for u in data.values() if isinstance(u, dict) and not client_archive(u)]
     total = len(utilisateurs)
     actifs = sum(1 for u in utilisateurs if abonnement_actif(u) or u.get("vip"))
     vip = sum(1 for u in utilisateurs if u.get("vip"))
@@ -3148,6 +3439,191 @@ async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(texte, parse_mode=ParseMode.HTML, reply_markup=bouton_admin_panel())
 
 @handler_securise
+async def admin_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        texte_admin_panel(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_admin_panel(),
+    )
+
+@handler_securise
+async def admin_new_client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = migrer_si_besoin(charger_users())
+    code, maintenant = creer_client_dans_data(data)
+    ok = safe_sauvegarder_users(data)
+    if not ok:
+        await query.edit_message_text("❌ Erreur lors de l'enregistrement du client. Vérifiez les logs.", parse_mode=ParseMode.HTML)
+        return
+
+    await query.edit_message_text(
+        texte_client_cree(code, maintenant, lien=lien_invitation_client(context, code)),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_fiche_client_admin(code),
+    )
+
+@handler_securise
+async def admin_client_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    code = query.data.replace("admin_client_", "", 1).upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code)
+    if uid_cible is None:
+        await query.edit_message_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    user = data[uid_cible]
+    appliquer_expiration_si_necessaire(user)
+    sauvegarder_users(data)
+    await query.edit_message_text(
+        texte_fiche_client_admin(uid_cible, user),
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_fiche_client_admin(code),
+    )
+
+@handler_securise
+async def admin_client_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    match = re.match(r"^admin_action_([a-z]+)_([A-Z0-9]+)$", query.data or "")
+    if not match:
+        await query.edit_message_text("Action invalide.", parse_mode=ParseMode.HTML, reply_markup=bouton_admin_panel())
+        return
+
+    action, code = match.group(1), match.group(2)
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code)
+    if uid_cible is None:
+        await query.edit_message_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    if action == "history":
+        await query.edit_message_text(
+            texte_historique_client(data[uid_cible]),
+            parse_mode=ParseMode.HTML,
+            reply_markup=bouton_fiche_client_admin(code),
+        )
+        return
+
+    if action == "delete":
+        await query.edit_message_text(
+            "⚠️ <b>SUPPRESSION CLIENT</b>\n\n"
+            f"Client :\n<code>{echapper_html_texte(code)}</code>\n\n"
+            "Cette action supprime complètement le client, ses doublons éventuels et son accès au bot.\n\n"
+            "Après suppression, il faudra créer un nouveau client et lui envoyer un nouveau lien.\n\n"
+            "Confirmer ?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bouton_confirmation_suppression_client(code),
+        )
+        return
+
+    if action in {"recharge", "addsignal"}:
+        titre = "💰 <b>Recharge</b>" if action == "recharge" else "➕ <b>Ajouter signaux</b>"
+        prefix = "admin_recharge" if action == "recharge" else "admin_addsignal"
+        await query.edit_message_text(
+            f"{titre}\n\n"
+            f"Client :\n<code>{echapper_html_texte(code)}</code>\n\n"
+            "Nombre de signaux :",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bouton_montants_admin(prefix, code),
+        )
+        return
+
+    if action in {"devip", "desabo"}:
+        titre = "RETIRER VIP ?" if action == "devip" else "DÉSACTIVER ABONNEMENT ?"
+        detail = (
+            "Le compte, l'historique et les paiements seront conservés."
+            if action == "devip"
+            else "Le client, l'historique, les signaux et les paiements seront conservés."
+        )
+        await query.edit_message_text(
+            f"⚠️ <b>{titre}</b>\n\n"
+            f"Client :\n<code>{echapper_html_texte(code)}</code>\n\n"
+            f"{detail}\n\n"
+            "Confirmer ?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=bouton_confirmation_action_client(action, code),
+        )
+        return
+
+    commandes = {
+        "abonnement": f"/abonnement {code}",
+        "vip": f"/vip {code}",
+        "ban": f"/ban {code}",
+        "unban": f"/unban {code}",
+    }
+    commande = commandes.get(action)
+    if not commande:
+        await query.edit_message_text("Action non disponible.", parse_mode=ParseMode.HTML, reply_markup=bouton_fiche_client_admin(code))
+        return
+
+    await query.edit_message_text(
+        "⚙️ <b>ACTION CLIENT</b>\n\n"
+        f"Client :\n<code>{echapper_html_texte(code)}</code>\n\n"
+        "Utilisez cette commande :\n"
+        f"<code>{echapper_html_texte(commande)}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_fiche_client_admin(code),
+    )
+
+@handler_securise
+async def admin_montant_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    match = re.match(r"^admin_(recharge|addsignal)_([A-Z0-9]+)_(50|100|250|500)$", query.data or "")
+    if not match:
+        await query.edit_message_text("Montant invalide.", parse_mode=ParseMode.HTML, reply_markup=bouton_admin_panel())
+        return
+
+    action, code, nombre_txt = match.group(1), match.group(2), match.group(3)
+    nombre = int(nombre_txt)
+    await query.edit_message_text("Enregistrement en cours...", parse_mode=ParseMode.HTML)
+    if action == "recharge":
+        await appliquer_recharge_admin(context, query.message.chat_id, code, nombre, limite_jour=None)
+    else:
+        await appliquer_ajout_signaux_admin(context, query.message.chat_id, code, nombre)
+
+@handler_securise
+async def admin_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    context.user_data["broadcast_waiting"] = True
+    await query.edit_message_text(
+        "📢 <b>Broadcast</b>\n\nEnvoyez maintenant le message à diffuser.\n\n"
+        "Cible actuelle : tous les clients non bannis et non archivés.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=bouton_admin_panel(),
+    )
+
+@handler_securise
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
         await refuser_non_admin(update)
@@ -3155,39 +3631,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sauvegarder_admin_id(update.effective_user.id)
     await update.message.reply_text(
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "💥 <b>CRASH ADMIN PANEL</b>\n\n"
-        "🇷🇺 <b>ПАНЕЛЬ УПРАВЛЕНИЯ</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "👥 Clients\n"
-        "💰 Recharges\n"
-        "👑 Abonnements\n"
-        "📊 Statistiques\n"
-        "📢 Broadcast\n"
-        "🚫 Sécurité\n"
-        "⚙️ Paramètres\n"
-        "⚠️ Expirations\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "🛠 Commandes admin disponibles :\n\n"
-        "<code>/clients</code> — Liste tous les clients et leur statut\n"
-        "<code>/stats</code> — Statistiques générales du bot\n"
-        "<code>/checksubscriptions</code> — Abonnements proches de l'expiration\n"
-        "<code>/recharge CODE NOMBRE</code> — Recharge un VIP classique\n"
-        "<code>/vip CODE</code> — Active le VIP classique, sans signaux automatiques\n"
-        "<code>/devip CODE</code> — Retire le statut VIP d'un client\n"
-        "<code>/abonnement CODE</code> — Abonnement VIP illimité 30j\n"
-        "<code>/desabo CODE</code> — Coupe l'abonnement mensuel d'un client\n"
-        "<code>/resetdevice CODE</code> — Réinitialise le Telegram ID associé\n"
-        "<code>/ban CODE</code> — Bannit définitivement un client\n"
-        "<code>/unban CODE</code> — Retire le bannissement\n"
-        "<code>/info CODE</code> — Affiche la fiche complète du client\n"
-        "<code>/addsignal CODE NOMBRE</code> — Ajoute des signaux au solde\n"
-        "<code>/reset CODE</code> — Réinitialise complètement un client\n"
-        "<code>/broadcast</code> — Diffuse un message à tous les utilisateurs\n"
-        "<code>/createclient</code> — Crée automatiquement un client et génère le lien d'invitation\n"
-        "<code>/deleteclient CODE</code> — Archive un client après confirmation\n"
-        "<code>/restoreclient CODE</code> — Restaure un client archivé\n"
-        "<code>/admin</code> — Affiche ce menu",
+        texte_admin_panel(),
         parse_mode=ParseMode.HTML,
         reply_markup=bouton_admin_panel(),
     )
@@ -3829,6 +4273,7 @@ def creer_application():
     # Nouvelle commande createclient
     app.add_handler(CommandHandler("createclient", createclient_cmd))
     app.add_handler(CommandHandler("deleteclient", deleteclient_cmd))
+    app.add_handler(CommandHandler("delecteclient", deleteclient_cmd))
     app.add_handler(CommandHandler("restoreclient", restoreclient_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_message))
     
@@ -3837,9 +4282,17 @@ def creer_application():
     app.add_handler(CallbackQueryHandler(choix_type_client_abonnement_callback, pattern="^subscription_client_(new|old)$"))
     app.add_handler(CallbackQueryHandler(confirmation_abonnement_callback, pattern="^subscription_confirm_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(admin_clients_callback, pattern="^admin_clients$"))
+    app.add_handler(CallbackQueryHandler(admin_clients_callback, pattern="^admin_clients_page_\\d+$"))
     app.add_handler(CallbackQueryHandler(admin_stats_callback, pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(admin_expirations_callback, pattern="^admin_expirations$"))
+    app.add_handler(CallbackQueryHandler(admin_home_callback, pattern="^admin_home$"))
+    app.add_handler(CallbackQueryHandler(admin_new_client_callback, pattern="^admin_new_client$"))
+    app.add_handler(CallbackQueryHandler(admin_client_detail_callback, pattern="^admin_client_[A-Z0-9]+$"))
+    app.add_handler(CallbackQueryHandler(admin_montant_callback, pattern="^admin_(recharge|addsignal)_[A-Z0-9]+_(50|100|250|500)$"))
+    app.add_handler(CallbackQueryHandler(admin_client_action_callback, pattern="^admin_action_[a-z]+_[A-Z0-9]+$"))
+    app.add_handler(CallbackQueryHandler(admin_broadcast_callback, pattern="^admin_broadcast$"))
     app.add_handler(CallbackQueryHandler(deleteclient_confirmation_callback, pattern="^deleteclient_(confirm_[A-Z0-9]+|cancel)$"))
+    app.add_handler(CallbackQueryHandler(confirmation_action_client_callback, pattern="^confirm_((devip|desabo)_[A-Z0-9]+|cancel_[A-Z0-9]+)$"))
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
     app.add_handler(CallbackQueryHandler(compte_menu_callback, pattern="^compte_menu$"))
     app.add_handler(CallbackQueryHandler(vip_menu_callback, pattern="^vip_menu$"))
