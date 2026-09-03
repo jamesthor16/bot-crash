@@ -10,6 +10,8 @@ import random
 import re
 import string
 import threading
+import urllib.error
+import urllib.request
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -39,6 +41,12 @@ ANALYSE_MIN_SECONDS = 8
 ANALYSE_MAX_SECONDS = 15
 HISTORIQUE_LIMIT = 100
 SIGNAL_MEMORY_LIMIT = 20
+CRASH_HISTORY_LIMIT = 10
+CRASH_HISTORY_URL = "https://crash-gateway-grm-cr.gamedev-tech.cc/history"
+CRASH_CUSTOMER_ID = os.getenv("CRASH_CUSTOMER_ID", "").strip()
+CRASH_SESSION_ID = os.getenv("CRASH_SESSION_ID", "").strip()
+CRASH_HTTP_TIMEOUT = float(os.getenv("CRASH_HTTP_TIMEOUT", "8"))
+ADMIN_TELEGRAM_ID = lire_entier_env("ADMIN_TELEGRAM_ID", 0)
 OPPORTUNITE_REFUS_PROBABILITY = 0.07
 SAFE_DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 POSTGRES_SCHEMA = os.getenv("CRASH_DB_SCHEMA", "crash")
@@ -71,6 +79,13 @@ def format_fcfa(n):
     except Exception:
         return str(n)
 
+def lire_entier_env(nom, defaut=0):
+    valeur = os.getenv(nom, "").strip()
+    try:
+        return int(valeur)
+    except (TypeError, ValueError):
+        return defaut
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -85,6 +100,9 @@ analyses_lock = threading.Lock()
 analyses_en_cours = set()
 signal_history_lock = threading.Lock()
 derniers_signaux_generes = []
+crash_api_state_lock = threading.Lock()
+crash_api_session_alert_sent = False
+bot = None
 
 class PostgreSQLObligatoireError(RuntimeError):
     pass
@@ -1421,6 +1439,226 @@ def derniers_multiplicateurs(user, limite=SIGNAL_MEMORY_LIMIT):
         valeurs.extend(derniers_signaux_generes[-limite:])
     return valeurs
 
+def _extraire_coefficient_crash(entree):
+    if not isinstance(entree, dict):
+        return None
+
+    valeur = entree.get("topCoefficient")
+    if valeur is None:
+        final_values = entree.get("finalValues") or []
+        if final_values:
+            valeur = final_values[0]
+
+    try:
+        coefficient = float(valeur)
+    except (TypeError, ValueError):
+        return None
+
+    if coefficient <= 0:
+        return None
+    return round(coefficient, 2)
+
+def _message_alerte_api_crash():
+    return (
+        "🚨 ALERTE BOT CRASH\n\n"
+        "L'API Crash n'est plus accessible.\n\n"
+        "Cause :\n"
+        "Session-ID expiré ou invalide.\n\n"
+        "Action :\n"
+        "Renouveler CRASH_SESSION_ID dans Railway."
+    )
+
+def _message_retour_api_crash():
+    return (
+        "✅ BOT CRASH\n\n"
+        "Connexion API rétablie.\n\n"
+        "Le système fonctionne normalement."
+    )
+
+async def envoyer_alerte_admin(message):
+    if not ADMIN_TELEGRAM_ID or bot is None:
+        logger.warning("Alerte admin impossible: ADMIN_TELEGRAM_ID ou bot non configure.")
+        return
+    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
+
+def _declencher_alerte_admin(message):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning("Impossible de declencher l'alerte admin: aucune boucle asynchrone active.")
+        return
+    loop.create_task(envoyer_alerte_admin(message))
+
+def _mettre_a_jour_etat_api_crash(status_code):
+    global crash_api_session_alert_sent
+    with crash_api_state_lock:
+        if status_code in (401, 403):
+            if not crash_api_session_alert_sent:
+                crash_api_session_alert_sent = True
+                _declencher_alerte_admin(_message_alerte_api_crash())
+        elif status_code == 200 and crash_api_session_alert_sent:
+            crash_api_session_alert_sent = False
+            _declencher_alerte_admin(_message_retour_api_crash())
+
+def get_crash_history():
+    if not CRASH_CUSTOMER_ID or not CRASH_SESSION_ID:
+        logger.warning("CRASH history API not configured: missing CRASH_CUSTOMER_ID or CRASH_SESSION_ID.")
+        return []
+
+    headers = {
+        "accept": "application/json",
+        "customer-id": CRASH_CUSTOMER_ID,
+        "session-id": CRASH_SESSION_ID,
+    }
+    request = urllib.request.Request(CRASH_HISTORY_URL, headers=headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(request, timeout=CRASH_HTTP_TIMEOUT) as response:
+            status_code = getattr(response, "status", response.getcode())
+            _mettre_a_jour_etat_api_crash(status_code)
+            payload = response.read().decode("utf-8", errors="replace")
+            data = json.loads(payload)
+    except urllib.error.HTTPError as exc:
+        _mettre_a_jour_etat_api_crash(getattr(exc, "code", None))
+        logger.warning("Impossible de recuperer l'historique Crash: %s", exc)
+        return []
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Impossible de recuperer l'historique Crash: %s", exc)
+        return []
+
+    if isinstance(data, dict):
+        for key in ("history", "items", "data", "results"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+
+    if not isinstance(data, list):
+        logger.warning("Format inattendu pour l'historique Crash.")
+        return []
+
+    coefficients = []
+    for entree in data:
+        coefficient = _extraire_coefficient_crash(entree)
+        if coefficient is not None:
+            coefficients.append(coefficient)
+        if len(coefficients) >= CRASH_HISTORY_LIMIT:
+            break
+    return coefficients[:CRASH_HISTORY_LIMIT]
+
+def analyser_tendance_crash(valeurs):
+    if not valeurs:
+        return "stable"
+    if len(valeurs) < 2:
+        return "stable"
+
+    milieu = max(1, len(valeurs) // 2)
+    recents = valeurs[:milieu]
+    anciens = valeurs[milieu:]
+    if not anciens:
+        return "stable"
+
+    moyenne_recente = sum(recents) / len(recents)
+    moyenne_ancienne = sum(anciens) / len(anciens)
+    ecart = moyenne_recente - moyenne_ancienne
+
+    if ecart >= 0.15:
+        return "positive"
+    if ecart <= -0.15:
+        return "negative"
+    return "stable"
+
+def analyse_crash_history():
+    historique = get_crash_history()
+    derniers_10 = historique[:CRASH_HISTORY_LIMIT]
+    derniers_5 = derniers_10[:5]
+
+    moyenne_5 = round(sum(derniers_5) / len(derniers_5), 2) if derniers_5 else 0.0
+    moyenne_10 = round(sum(derniers_10) / len(derniers_10), 2) if derniers_10 else 0.0
+    low_crash_count = sum(1 for valeur in derniers_10 if valeur < 1.50)
+    high_crash_count = sum(1 for valeur in derniers_10 if valeur > 2.00)
+    tendance = analyser_tendance_crash(derniers_10)
+    low_frequency = round(low_crash_count / len(derniers_10), 2) if derniers_10 else 0.0
+    high_frequency = round(high_crash_count / len(derniers_10), 2) if derniers_10 else 0.0
+
+    return {
+        "last_5": derniers_5,
+        "last_10": derniers_10,
+        "average_5": moyenne_5,
+        "average_10": moyenne_10,
+        "low_crash_count": low_crash_count,
+        "high_crash_count": high_crash_count,
+        "low_crash_frequency": low_frequency,
+        "high_multiplier_frequency": high_frequency,
+        "trend": tendance,
+    }
+
+def calculer_niveau_risque(analyse):
+    last_10 = analyse.get("last_10") or []
+    if not last_10:
+        return 1.0
+
+    average_5 = float(analyse.get("average_5", 0.0) or 0.0)
+    average_10 = float(analyse.get("average_10", 0.0) or 0.0)
+    low_count = int(analyse.get("low_crash_count", 0) or 0)
+    high_count = int(analyse.get("high_crash_count", 0) or 0)
+    trend = analyse.get("trend", "stable")
+
+    risk = 0.0
+    risk += min(0.9, low_count * 0.18)
+    risk += min(0.6, max(0, 2.2 - average_10) * 0.20)
+    risk += min(0.4, max(0, 2.0 - average_5) * 0.15)
+    risk += min(0.3, max(0, 4 - high_count) * 0.05)
+
+    if trend == "negative":
+        risk += 0.25
+    elif trend == "positive":
+        risk -= 0.10
+
+    return max(0.0, min(1.8, round(risk, 2)))
+
+def calculer_multiplicateur(analyse):
+    average_5 = float(analyse.get("average_5", 0.0) or 0.0)
+    average_10 = float(analyse.get("average_10", 0.0) or 0.0)
+    trend = analyse.get("trend", "stable")
+    low_count = int(analyse.get("low_crash_count", 0) or 0)
+    high_count = int(analyse.get("high_crash_count", 0) or 0)
+    risque = calculer_niveau_risque(analyse)
+
+    if not analyse.get("last_10"):
+        return 1.80
+
+    if risque <= 0.55 and average_5 >= 2.0 and average_10 >= 1.9 and low_count <= 1:
+        objectif_min, objectif_max = 2.00, 3.00
+    elif risque <= 1.05 and high_count >= 4:
+        objectif_min, objectif_max = 1.80, 2.40
+    else:
+        objectif_min, objectif_max = 1.40, 1.90
+
+    base = (average_5 * 0.45) + (average_10 * 0.55)
+    if trend == "positive":
+        base += 0.12
+    elif trend == "negative":
+        base -= 0.18
+
+    base -= risque * 0.22
+    base = max(objectif_min, min(objectif_max, base))
+    return round(max(1.40, min(3.00, base)), 2)
+
+def calculer_assurance(analyse):
+    risque = calculer_niveau_risque(analyse)
+
+    if not analyse.get("last_10"):
+        return 1.60
+
+    if risque <= 0.55:
+        assurance = 2.20 - (risque * 0.7)
+    elif risque <= 1.05:
+        assurance = 1.85 - ((risque - 0.55) * 0.6)
+    else:
+        assurance = 1.70 - ((risque - 1.05) * 0.5)
+
+    return round(max(1.40, min(2.20, assurance)), 2)
+
 def opportunite_marche_disponible(user):
     historique = user.get("historique_signaux", [])
     maintenant = datetime.datetime.now()
@@ -1510,13 +1748,13 @@ async def lancer_animation_analyse(query, user_id):
 
     return message
 
-def generer_multiplicateur_pondere_crash():
-    """Logique CRASH AI originale : multiplicateur entre 2.00x et 3.50x."""
-    return round(random.uniform(2.00, 3.50), 2)
+def generer_multiplicateur_pondere_crash(analyse=None):
+    analyse = analyse or analyse_crash_history()
+    return calculer_multiplicateur(analyse)
 
-def generer_assurance_crash(coefficient=None):
-    """Logique CRASH AI originale : assurance indépendante entre 1.50x et 2.50x."""
-    return round(random.uniform(1.50, 2.50), 2)
+def generer_assurance_crash(coefficient=None, analyse=None):
+    analyse = analyse or analyse_crash_history()
+    return calculer_assurance(analyse)
 
 def delai_signal_crash(coefficient):
     """Délai original déterminé uniquement depuis le multiplicateur."""
@@ -1531,14 +1769,15 @@ def delai_signal_crash(coefficient):
 
 def generer_signal(user=None):
     heure_date = maintenant_crash()
-    coefficient_number = generer_multiplicateur_pondere_crash()
+    analyse = analyse_crash_history()
+    coefficient_number = calculer_multiplicateur(analyse)
     deja_vus = {f"{float(valeur):.2f}" for valeur in derniers_multiplicateurs(user or {})}
     for _ in range(12):
         if f"{coefficient_number:.2f}" not in deja_vus:
             break
-        coefficient_number = generer_multiplicateur_pondere_crash()
+        coefficient_number = calculer_multiplicateur(analyse)
 
-    assurance = generer_assurance_crash(coefficient_number)
+    assurance = calculer_assurance(analyse)
     minutes = delai_signal_crash(coefficient_number)
     heure_date = heure_date + datetime.timedelta(minutes=minutes)
     memoriser_signal_interne(coefficient_number)
@@ -4251,6 +4490,8 @@ def creer_application():
         raise RuntimeError("La variable d'environnement TOKEN est obligatoire.")
     
     app = ApplicationBuilder().token(TOKEN).post_init(supprimer_webhook).build()
+    global bot
+    bot = app.bot
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clean", clean))
     app.add_handler(CommandHandler("moncode", mon_code))
