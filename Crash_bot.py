@@ -29,6 +29,13 @@ from telegram.ext import (
     filters,
 )
 
+def lire_entier_env(nom, defaut=0):
+    valeur = os.getenv(nom, "").strip()
+    try:
+        return int(valeur)
+    except (TypeError, ValueError):
+        return defaut
+
 # mise a jour
 TOKEN = os.getenv("TOKEN")
 DATA_FILE = "users.json"
@@ -78,14 +85,6 @@ def format_fcfa(n):
         return f"{int(n):,}".replace(",", " ")
     except Exception:
         return str(n)
-
-def lire_entier_env(nom, defaut=0):
-    valeur = os.getenv(nom, "").strip()
-    try:
-        return int(valeur)
-    except (TypeError, ValueError):
-        return defaut
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
