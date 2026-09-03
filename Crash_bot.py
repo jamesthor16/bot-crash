@@ -1505,15 +1505,19 @@ def get_crash_history():
         return []
 
     headers = {
-        "accept": "application/json",
+        "accept": "application/json, text/plain, */*",
         "customer-id": CRASH_CUSTOMER_ID,
         "session-id": CRASH_SESSION_ID,
+        "origin": "https://1play.gamedev-tech.cc",
+        "referer": "https://1play.gamedev-tech.cc/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36",
     }
     request = urllib.request.Request(CRASH_HISTORY_URL, headers=headers, method="GET")
 
     try:
         with urllib.request.urlopen(request, timeout=CRASH_HTTP_TIMEOUT) as response:
             status_code = getattr(response, "status", response.getcode())
+            logger.info("Crash API status: %s", status_code)
             _mettre_a_jour_etat_api_crash(status_code)
             payload = response.read().decode("utf-8", errors="replace")
             data = json.loads(payload)
@@ -1534,6 +1538,8 @@ def get_crash_history():
     if not isinstance(data, list):
         logger.warning("Format inattendu pour l'historique Crash.")
         return []
+
+    logger.info("Crash history count: %s", len(data))
 
     coefficients = []
     for entree in data:
