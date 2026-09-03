@@ -1755,14 +1755,43 @@ def generer_assurance_crash(coefficient=None, analyse=None):
     analyse = analyse or analyse_crash_history()
     return calculer_assurance(analyse)
 
-def delai_signal_crash(coefficient):
-    """Délai original déterminé uniquement depuis le multiplicateur."""
-    c = float(coefficient) if isinstance(coefficient, (int, float)) else 0
-    if c >= 3.10:
+def calculer_delai_signal(analyse):
+    last_5 = analyse.get("last_5") or []
+    last_10 = analyse.get("last_10") or []
+    average_5 = float(analyse.get("average_5", 0.0) or 0.0)
+    average_10 = float(analyse.get("average_10", 0.0) or 0.0)
+    low_crash_count = int(analyse.get("low_crash_count", 0) or 0)
+    high_crash_count = int(analyse.get("high_crash_count", 0) or 0)
+    trend = analyse.get("trend", "stable")
+
+    if not last_10:
         return 4
-    if c >= 2.70:
+
+    score = 0.0
+    score += min(2.0, max(0.0, 2.2 - average_10) * 1.2)
+    score += min(1.5, max(0.0, 1.9 - average_5) * 1.1)
+    score += min(1.5, low_crash_count * 0.35)
+    score -= min(1.4, max(0, high_crash_count - 2) * 0.25)
+
+    if trend == "negative":
+        score += 0.7
+    elif trend == "positive":
+        score -= 0.7
+
+    if len(last_5) >= 3 and all(valeur < 1.50 for valeur in last_5[:3]):
+        score += 0.6
+    if len(last_5) >= 3 and sum(1 for valeur in last_5 if valeur > 3.00) >= 2:
+        score -= 0.5
+
+    if score >= 2.4:
+        return 2
+    if score >= 1.5:
+        return 3
+    if score >= 0.6:
+        return 4
+    if score >= -0.3:
         return 5
-    if c >= 2.30:
+    if score >= -1.1:
         return 6
     return 7
 
@@ -1777,7 +1806,7 @@ def generer_signal(user=None):
         coefficient_number = calculer_multiplicateur(analyse)
 
     assurance = calculer_assurance(analyse)
-    minutes = delai_signal_crash(coefficient_number)
+    minutes = calculer_delai_signal(analyse)
     heure_date = heure_date + datetime.timedelta(minutes=minutes)
     memoriser_signal_interne(coefficient_number)
 
